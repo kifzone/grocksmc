@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.ex5
+*.log
+/research-data/
+/test-results/

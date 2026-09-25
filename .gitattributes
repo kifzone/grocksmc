@@ -1,0 +1,2 @@
+# Preserve the indicator's original CRLF convention without false whitespace errors.
+*.mq5 -text whitespace=cr-at-eol
