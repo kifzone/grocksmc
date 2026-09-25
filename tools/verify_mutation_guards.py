@@ -17,6 +17,15 @@ MUTANTS = [
  ('FVG identity', 'engine',
   'if(g_fvgs[i].bar==fvg.bar && g_fvgs[i].bullish==fvg.bullish) return;',
   'if(false) return;'),
+ ('P1 bypass binary indexed path', 'p1',
+  'int nearest=BinarySearchNearestOB(price,nearest_pos);',
+  'int nearest=-1; // MUTANT: skip indexed search'),
+ ('P1 skip right-confirm bars', 'p1',
+  'closed_bar-break_bar>=InpMinRightConfirmBars;',
+  'closed_bar>=break_bar; // MUTANT: no additional closed bars'),
+ ('P1 ignore missing boolean factors', 'p1',
+  'if(remaining%2!=0 && !g_signal_flags[i]) return false;',
+  'if(false) return false; // MUTANT: accept missing factors'),
 ]
 
 if __name__=='__main__':

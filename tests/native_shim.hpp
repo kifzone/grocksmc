@@ -31,8 +31,12 @@ template<class... T> string StringFormat(const string&,T...){return "";}
 string DoubleToString(double x,int digits=5){return std::to_string(x);}
 string IntegerToString(long x){return std::to_string(x);}
 string TimeToString(datetime,int){return "";}
-template<class... T> void Print(T...){}
-void DebugPrint(string){}
+std::vector<string> fixture_logs;
+extern bool DebugMode;
+template<class... T> void Print(T... values){
+ std::ostringstream out; (out<<...<<values); fixture_logs.push_back(out.str());
+}
+void DebugPrint(string s){if(DebugMode) fixture_logs.push_back(s);}
 void DebugError(string,string,int){}
 void LogLifecycle(string){}
 string PF(bool b){return b?"PASS":"FAIL";}
@@ -70,6 +74,15 @@ datetime g_vwap_anchor=0;
 double g_cum_pv=0,g_cum_v=0;
 datetime DayAnchor(datetime t){return t-t%86400;}
 bool InpMergeFVG=true;
+// P1 fixture parameters and calendar stand-ins; terminal CopyBuffer/calendar
+// behavior and whole-indicator scheduling are intentionally not simulated.
+bool InpUseBinarySearch=true,InpUseBitMasking=true,InpRelaxedMode=true;
+bool InpShowDebugAlerts=false;
+double InpMaxOBDistATR=8.0;
+int InpMinRightConfirmBars=1,InpLondonStart=8,InpNewYorkStart=13;
+int g_rates_total=0,g_htf_bias=0,g_judas=0;
+struct MqlDateTime{int hour=0;};
+void TimeToStruct(datetime t,MqlDateTime &st){st.hour=(int)((t%86400+86400)%86400/3600);}
 
 const string _Symbol="FIXTURE";
 int InpZoneLookback=150,InpMaxZonesShown=3,InpFVGLookbackBars=100,InpMaxStrongOB=3;

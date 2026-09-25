@@ -58,6 +58,19 @@ def static_check():
     assert 'g_htf_cache_time=ht; g_d1_cache_time=dt; // commit successful cache only' in defs['ComputeHTFBias']
     assert 'CalculateProbability' not in defs
     assert 'INSUFFICIENT DATA' in defs['DrawQuantumDashboard']
+    # P1 integration guards: fixture coverage below runs selected functions,
+    # while this lint checks that OnCalculate feeds their result into the gate.
+    calc,masker,selector=defs['CalculateAITradeSetup'],defs['UpdateSignalMask'],defs['SelectEntryOB']
+    assert 'BinarySearchNearestOB(price,nearest_pos)' in selector
+    assert 'IsLatestStructureConfirmed(total-2)' in masker
+    assert 'if(InpUseBitMasking) g_signal_mask|=bit;' in defs['MarkSignalFactor']
+    assert 'if(InpUseBitMasking) return (g_signal_mask & required_mask)==required_mask;' in defs['CheckSignalPattern']
+    assert 'IsLatestStructureConfirmed(closed_bar)' in calc
+    assert calc.index('if(!gate_right_confirm)') < calc.index('SSignalFactor f[]') < calc.index('SelectEntryOB(')
+    assert 'Right Confirm   : FAIL' in calc and 'Right Confirm   : %s' in calc
+    assert 'InpMinRightConfirmBars<0' in defs['OnInit']
+    assert 'UpdateSignalMask(rates_total,g_buf_c);' in defs['OnCalculate']
+    assert not re.search(r'\b(?:OrderSend|CTrade|PositionOpen|OnTick)\s*\(', clean)
     print(f'PASS limited static lint: {len(defs)} unique definitions, {len(decls)} matched forwards, delimiters/call names/regression guards')
     print('NOT RUN: whole-indicator MQL5 syntax/type compilation (MetaEditor unavailable)')
 

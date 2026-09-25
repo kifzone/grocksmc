@@ -206,10 +206,159 @@ void historical_zones(){
  assert(g_order_blocks.empty() && g_zones.empty() && g_fvgs.empty() && !g_data_ready);short_copy=false;g_data_ready=true;
  std::cout<<"PASS historical zone/OB ATR, no live/pre-availability OB touch, short-copy rejection\n";
 }
+bool logged(const string& needle){
+ for(const auto& s:fixture_logs) if(s.find(needle)!=string::npos) return true;
+ return false;
+}
+void p1_ob_search(){
+ g_order_blocks.clear();g_ob_price_idx.clear();
+ InpRelaxedMode=true;InpUseBinarySearch=true;DebugMode=true;
+ fixture_logs.clear();
+ assert(SelectEntryOB(100,true,1)==-1);
+ assert(logged("no OB; binary configured"));
+ auto add_ob=[](double mid,int strength,bool bullish,string state){
+  SOrderBlock ob{};ob.bar=(int)g_order_blocks.size();
+  ob.bottom=mid-.05;ob.top=mid+.05;
+  ob.strength=strength;ob.bullish=bullish;ob.state=state;
+  ob.id="OB_"+std::to_string(ob.bar);
+  g_order_blocks.push_back(ob);
+ };
+ // The nearest by price is opposite direction; a farther, stronger, unmitigated
+ // block wins. An equal-score newer block must NOT win because of index sorting.
+ add_ob(100,5,false,"ACTIVE");
+ add_ob(99,5,true,"ACTIVE");
+ add_ob(100.3,3,true,"ACTIVE");
+ add_ob(98.5,5,true,"MITIGATED");
+ add_ob(107,5,true,"ACTIVE");
+ add_ob(100.4,4,true,"TOUCHED");
+ add_ob(101,5,true,"ACTIVE");
+ BuildOBPriceIndex();
+ fixture_logs.clear();
+ assert(SelectEntryOB(100,true,1)==1 && g_ob_search_path=="binary price-index");
+ assert(logged("OB Search path: binary price-index"));
+ InpUseBinarySearch=false;
+ fixture_logs.clear();
+ assert(SelectEntryOB(100,true,1)==1 && g_ob_search_path=="linear scan");
+ assert(logged("OB Search path: linear scan"));
+ // Strict mode applies exactly the same side-of-price and distance rules.
+ InpRelaxedMode=false;InpMaxOBDistATR=1.5;
+ assert(SelectEntryOB(100,true,1)==1);
+ InpUseBinarySearch=true;g_ob_price_idx.clear(); // on-demand index rebuild
+ fixture_logs.clear();
+ assert(SelectEntryOB(100,true,1)==1 && g_ob_price_idx.size()==g_order_blocks.size());
+ assert(logged("scanned 6/7")); // index bounds the work to midpoints <= 1.5 ATR
+ // Equal scores across the two sides of price: master chronology wins.
+ g_order_blocks.clear();
+ add_ob(101,5,true,"ACTIVE"); // oldest, sorted to the right
+ add_ob(99,5,true,"ACTIVE");
+ add_ob(100,5,false,"ACTIVE");
+ BuildOBPriceIndex();InpRelaxedMode=true;
+ assert(SelectEntryOB(100,true,1)==0);
+ InpUseBinarySearch=false;assert(SelectEntryOB(100,true,1)==0);
+ // Deterministic property check: same result across both paths with random
+ // direction, mitigation, strength, prices, ties, relaxed and strict windows.
+ std::mt19937 rng(1872);DebugMode=false;
+ for(int run=0;run<500;run++){
+  g_order_blocks.clear();
+  int n=1+rng()%36;
+  for(int i=0;i<n;i++){
+   double mid=90+(rng()%601)/20.0;
+   int strength=1+rng()%6;
+   bool bull=(rng()%2)==0;
+   string state=(rng()%8==0)?"MITIGATED":(rng()%4==0)?"TOUCHED":"ACTIVE";
+   add_ob(mid,strength,bull,state);
+  }
+  BuildOBPriceIndex();
+  double price=95+(rng()%401)/20.0,atr=.25+(rng()%301)/100.0;
+  bool is_buy=(rng()%2)==0;
+  InpRelaxedMode=(rng()%2)==0;InpMaxOBDistATR=1+(rng()%120)/10.0;
+  InpUseBinarySearch=false;int linear=SelectEntryOB(price,is_buy,atr);
+  InpUseBinarySearch=true;int indexed=SelectEntryOB(price,is_buy,atr);
+  assert(linear==indexed && (indexed<0 || indexed<n));
+  for(int i=0;i<n;i++) assert(g_order_blocks[i].bar==i); // master order untouched
+ }
+ InpUseBinarySearch=true;InpRelaxedMode=true;InpMaxOBDistATR=8;
+ std::cout<<"PASS P1 OB binary indexed search vs linear scoring, ties and 500 fixtures\n";
+}
+void p1_confirmation_and_factors(){
+ g_structures.clear();g_order_blocks.clear();g_liquidity.clear();
+ g_fvgs.clear();g_zones.clear();
+ SStructureBreak older{};older.bar=4;older.type="BOS";older.bullish=false;
+ SStructureBreak latest{};latest.bar=10;latest.type="MSS";latest.bullish=true;
+ g_structures.push_back(older);g_structures.push_back(latest);
+ InpMinRightConfirmBars=1;
+ assert(!IsLatestStructureConfirmed(10)); // earlier eligible break cannot override latest pending one
+ assert(IsLatestStructureConfirmed(11));
+ InpMinRightConfirmBars=2;
+ assert(!IsLatestStructureConfirmed(11) && IsLatestStructureConfirmed(12));
+ InpMinRightConfirmBars=0;
+ assert(IsLatestStructureConfirmed(10)); // break bar itself is closed
+ InpMinRightConfirmBars=1;
+ Array<double> closes(12,115);
+ g_buf_t.resize(12);
+ for(int i=0;i<12;i++)g_buf_t[i]=86400LL*100+(i-1)*3600;
+ g_rates_total=12;
+ SOrderBlock ob{};ob.strength=5;ob.state="ACTIVE";g_order_blocks.push_back(ob);
+ SLiquidity liq{};liq.swept=true;g_liquidity.push_back(liq);
+ SFVG fvg{};fvg.state="OPEN";g_fvgs.push_back(fvg);
+ SZone demand{};demand.state="ACTIVE";demand.bullish=true;
+ demand.top=117;demand.bottom=112;g_zones.push_back(demand);
+ SZone supply=demand;supply.bullish=false;g_zones.push_back(supply);
+ g_range.valid=true;fixture_ote=true;g_htf_bias=1;g_judas=1;
+ int context=BIT_STRONG_OB|BIT_LIQUIDITY|BIT_FVG|BIT_OTE|BIT_HTF_BIAS|
+             BIT_KILLZONE|BIT_DEMAND_ZONE|BIT_SUPPLY_ZONE|BIT_JUDAS;
+ DebugMode=true;fixture_logs.clear();InpUseBitMasking=true;
+ UpdateSignalMask(12,closes); // closed index 10 is the break: pending with default extra bar
+ assert(g_signal_mask==context && !CheckSignalPattern(BIT_MSS));
+ assert(logged("path=BITMASK closed=10 structure=pending/none"));
+ InpUseBitMasking=false;fixture_logs.clear();UpdateSignalMask(12,closes);
+ assert(g_signal_mask==0 && g_signal_flags[FLAG_MSS]==false);
+ assert(CheckSignalPattern(context) && !CheckSignalPattern(context|BIT_MSS));
+ assert(logged("path=BOOL FLAGS closed=10 structure=pending/none"));
+ // Exhaustively compare every required pattern and an unknown bit with the
+ // enabled bitmask path. False uses arithmetic/boolean checks, not mask reads.
+ for(int mask=0;mask<(1<<(FLAG_COUNT+1));mask++)
+  assert(CheckSignalPattern(mask)==((context & mask)==mask));
+ closes[11]=-9999;g_buf_t[11]+=86400; // forming bar may be arbitrarily different
+ UpdateSignalMask(12,closes);
+ assert(g_signal_mask==0 && CheckSignalPattern(context) && !CheckSignalPattern(BIT_MSS));
+ closes[11]=115;g_buf_t[11]=86400LL*100+10*3600;
+ closes.push_back(115);g_buf_t.push_back(86400LL*100+11*3600);
+ g_rates_total=13;fixture_logs.clear();
+ UpdateSignalMask(13,closes); // bar 11 closed: exactly one extra closed bar
+ assert(IsLatestStructureConfirmed(11) && CheckSignalPattern(BIT_MSS));
+ assert(logged("structure=confirmed"));
+ InpMinRightConfirmBars=2;UpdateSignalMask(13,closes);
+ assert(!CheckSignalPattern(BIT_MSS));
+ InpMinRightConfirmBars=0;g_rates_total=12;
+ InpUseBitMasking=true;UpdateSignalMask(12,closes);
+ assert(CheckSignalPattern(BIT_MSS));
+ g_structures.clear();UpdateSignalMask(12,closes);
+ assert(!CheckSignalPattern(BIT_MSS));
+ // Every structural type is withheld at its break close and appears exactly
+ // after the configured additional closed bar, in BOTH flag representations.
+ string types[3]={"BOS","CHoCH","MSS"};
+ int bits[3]={BIT_BOS,BIT_CHOCH,BIT_MSS};
+ InpMinRightConfirmBars=1;
+ for(int k=0;k<3;k++){
+  latest.type=types[k];g_structures.clear();g_structures.push_back(latest);
+  for(int mode=0;mode<2;mode++){
+   InpUseBitMasking=(mode==0);
+   g_rates_total=12;UpdateSignalMask(12,closes);
+   assert(!CheckSignalPattern(bits[k]));
+   g_rates_total=13;UpdateSignalMask(13,closes);
+   assert(CheckSignalPattern(bits[k]));
+  }
+ }
+ DebugMode=false;InpUseBitMasking=true;InpMinRightConfirmBars=1;
+ fixture_ote=false;g_range.valid=false;g_htf_bias=0;g_judas=0;
+ std::cout<<"PASS P1 boolean/mask path parity (8192 patterns), closed-bar right-confirm 0/1/2 and live mutation\n";
+}
 int main(int argc,char** argv){
  string group=argc>1?argv[1]:"all";
  if(group=="all" || group=="causality")causality();
  if(group=="all" || group=="replay"){replay();vwap();}
  if(group=="all" || group=="no_lookahead"){future_mutation();historical_zones();}
  if(group=="all" || group=="engine"){lifecycle();fvg_identity();}
+ if(group=="all" || group=="p1"){p1_ob_search();p1_confirmation_and_factors();}
 }
