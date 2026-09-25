@@ -12,7 +12,11 @@ from source_tools import SOURCE, ROOT, definitions
 FUNCTIONS = ['IsFractalHigh', 'IsFractalLow', 'FindLastBearishOB', 'FindLastBullishOB',
              'DetectStructure', 'ManageSetupLifecycle', 'FillEMAAndVWAP', 'AddOrMergeFVG',
              'DetectZones', 'DetectFVG', 'IsDuplicateOB', 'IsDuplicateBreaker',
-             'AddBreakerBlock', 'BuildOBStrengthIndex', 'GenerateOBId', 'DetectOrderBlocks']
+             'AddBreakerBlock', 'BuildOBStrengthIndex', 'GenerateOBId', 'DetectOrderBlocks',
+             # P1: execute the production search/flag/confirmation functions, not copies.
+             'OBMid', 'BuildOBPriceIndex', 'BinarySearchNearestOB', 'SelectEntryOB',
+             'IsLatestStructureConfirmed', 'MarkSignalFactor', 'UpdateSignalMask',
+             'CheckSignalPattern']
 
 
 def adapt(text):
@@ -28,15 +32,28 @@ def run(group='all', text=None):
     text = SOURCE.read_text() if text is None else text
     defs = definitions(text)
     structs = '\n'.join(re.findall(r'(?m)^struct\s+\w+\s*\{[^}]*\};', text))
-    cpp = (ROOT/'tests/native_shim.hpp').read_text() + '\n' + structs + '''
+    bits = '\n'.join(re.findall(r'(?m)^#define BIT_\w+\s+[^\n]+', text))
+    flags = re.search(r'(?s)\benum ENUM_SIGNAL_FLAG\s*\{[^}]*\};', text)
+    assert flags, 'missing P1 signal flag indexes'
+    cpp = (ROOT/'tests/native_shim.hpp').read_text() + '\n' + bits + '\n' + flags[0] + '\n' + structs + '''
 Array<SStructureBreak> g_structures;
 Array<SOrderBlock> g_order_blocks;
 Array<SFVG> g_fvgs;
+Array<SLiquidity> g_liquidity;
 Array<SZone> g_zones;
 Array<SBreaker> g_breakers;
-Array<int> g_ob_strength_idx;
+Array<int> g_ob_strength_idx, g_ob_price_idx;
+Array<datetime> g_buf_t;
+SDealingRange g_range;
+int g_signal_mask=0;
+bool g_signal_flags[FLAG_COUNT];
+string g_ob_search_path;
 STradeSetup g_trade_setup;
 SActiveSetup g_active_setup;
+bool fixture_ote=false;
+bool GetOTEZone(double &top,double &bottom,bool &bullish){
+ top=120; bottom=110; bullish=true; return fixture_ote;
+}
 '''
     cpp += '\n'.join(adapt(defs[name]) for name in FUNCTIONS)
     cpp += '\n' + (ROOT/'tests/native_cases.cpp').read_text()

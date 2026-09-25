@@ -1,4 +1,4 @@
-// v5.7.1 causal-correctness increment; see ARCHITECTURE_REPORT.md.
+// v5.8.0 P1 signal-engine input wiring; v5.7.1 causal audit remains applicable.
 // NOT a validated predictive/replay engine. Legacy notes below are historical.
 //+------------------------------------------------------------------+
 //| QuantumSMC_AI_Pro_v5.4.0_Stable.mq5                              |
@@ -105,9 +105,31 @@
 //|      exact rejection reason; CopyBuffer failures are reported.      |
 //|  R11 Confirmed signals now leave a persistent, never-moved arrow    |
 //|      (QSMCSIG_ prefix) so history stays consistent after refresh.   |
+//|                                                                    |
+//| ============ AUDIT PASS - v5.8.0 P1 DEAD INPUTS ==============    |
+//| P1.1 ROOT: InpUseBinarySearch never reached SelectEntryOB; nearest  |
+//|      price alone cannot replace the direction/strength OB ranking.  |
+//| FIX: binary nearest in a sorted INDEX anchors a max-distance range; |
+//|      apply the original filters/score to every candidate in range.  |
+//|      Input=false uses the original linear scan. Ties keep the       |
+//|      oldest master index; no OB/Setup ID or master order changes.    |
+//| P1.2 ROOT: InpUseBitMasking was ignored; every check used bit ops.  |
+//| FIX: true uses compact mask and O(1) pattern tests; false stores   |
+//|      boolean factors and checks requested factors without bit ops.  |
+//|      False is clearer but checks up to 12 flags per pattern; the    |
+//|      dashboard/logs identify the path (no misleading zero mask).    |
+//| P1.3 ROOT: InpMinRightConfirmBars was only printed on the panel.   |
+//| FIX: the latest BOS/CHoCH/MSS must age by that many ADDITIONAL     |
+//|      CLOSED bars after the break (0 = immediate after break close)  |
+//|      before its mask bit or setup factors/levels can be used. Both  |
+//|      rebuild and incremental paths use total-2; pending events     |
+//|      cannot seed or replace a setup. Detection/drawing, existing   |
+//|      lifecycle, alerts, IDs and PFX/SIGPFX are unchanged.          |
+//| Local fixture/static checks cover P1 paths; MetaEditor compile and |
+//| MT5 visual/tester comparison still require a terminal (not here).  |
 //+------------------------------------------------------------------+
-#property copyright "Quantum SMC v5.7.1 Causal Correctness Increment"
-#property version   "5.71"
+#property copyright "Quantum SMC v5.8.0 P1 Signal Engine Inputs"
+#property version   "5.80"
 #property indicator_chart_window
 #property indicator_buffers 3
 #property indicator_plots   3
@@ -279,7 +301,7 @@ input bool InpRealTimeFractal = true;
 input bool InpShowEarlyZones = true;
 input int InpEarlyZoneTransparency = 94;
 input group "====== SPEED / LATENCY ======"
-input int InpMinRightConfirmBars = 1;
+input int InpMinRightConfirmBars = 1; // extra CLOSED bars after the structure break; 0 = no extra delay
 input bool InpShowLatencyInPanel = true;
 
 input group "====== SETUP -> RETEST -> CONFIRMED (NEW v5.2.0) ======"
@@ -318,6 +340,15 @@ input int    InpIncrementalTailBars     = 12;  // v5.4.1: how many recent bars t
 #define BIT_SUPPLY_ZONE   (1<<11)   // v5.7.0: SELL-side twin of BIT_DEMAND_ZONE (was missing -> SELL stricter than BUY)
 #define MAX_GRAPH_LINKS   16
 
+// Boolean-factor indexes mirror the bit positions above (without bitwise checks).
+enum ENUM_SIGNAL_FLAG
+{
+   FLAG_MSS, FLAG_BOS, FLAG_CHOCH, FLAG_STRONG_OB,
+   FLAG_LIQUIDITY, FLAG_FVG, FLAG_OTE, FLAG_HTF_BIAS,
+   FLAG_KILLZONE, FLAG_DEMAND_ZONE, FLAG_JUDAS, FLAG_SUPPLY_ZONE,
+   FLAG_COUNT
+};
+
 //====================================================================
 // GLOBALS
 //====================================================================
@@ -325,6 +356,8 @@ datetime g_last_bar_time = 0;
 int h_ema_fast, h_ema_slow, h_atr, h_adx, h_rsi;
 int h_ema_mtf[5];
 int g_signal_mask = 0;
+bool g_signal_flags[FLAG_COUNT]; // used only when InpUseBitMasking=false
+string g_ob_search_path="not run"; // actual code path shown in DebugMode
 bool g_data_ready=false; // fail closed on required data-copy failures
 double g_atr = 0.0;
 double g_adx = 0.0;
@@ -603,6 +636,9 @@ double PipSize();
 void RepositionDashboard();
 void CalculateAITradeSetup(const int,const double&[],const double&[],const double&[],const double&[]);
 void UpdateSignalMask(const int,const double&[]);
+bool IsLatestStructureConfirmed(const int);
+void MarkSignalFactor(const int,const int);
+int BinarySearchNearestOB(const double,int&);
 void BuildOBPriceIndex();
 void BuildOBStrengthIndex();
 void BuildLiquidityPriorityIndex();
@@ -1034,7 +1070,8 @@ int OnInit()
       InpSwingLookback<2 || InpOBLookback<1 || InpMaxStrongOB<1 || InpMaxZonesShown<1 ||
       InpIncrementalTailBars<InpLiquidityFractalN*2 || InpDisplacementATR<=0 ||
       InpZoneMaxHeightATR<=0 || InpOBMaxHeightATR<=0 || InpFVGMinSizeATR<=0 ||
-      InpOTEFibStart<0 || InpOTEFibEnd>1 || InpOTEFibStart>=InpOTEFibEnd)
+      InpOTEFibStart<0 || InpOTEFibEnd>1 || InpOTEFibStart>=InpOTEFibEnd ||
+      InpMinRightConfirmBars<0)
    {
       Print("Invalid periods, bounds, confirmation window or OTE inputs");
       return INIT_PARAMETERS_INCORRECT;
@@ -1053,7 +1090,7 @@ int OnInit()
    PlotIndexSetDouble(2,PLOT_EMPTY_VALUE,0.0);
    PlotIndexSetInteger(0,PLOT_DRAW_BEGIN,InpEMAFast);
    PlotIndexSetInteger(1,PLOT_DRAW_BEGIN,InpEMASlow);
-   IndicatorSetString(INDICATOR_SHORTNAME,"Quantum SMC AI Pro v5.7.1");
+   IndicatorSetString(INDICATOR_SHORTNAME,"Quantum SMC AI Pro v5.8.0");
 
    h_ema_fast = iMA(_Symbol, PERIOD_CURRENT, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
    h_ema_slow = iMA(_Symbol, PERIOD_CURRENT, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
@@ -1102,9 +1139,11 @@ int OnInit()
    g_d1_cache_time=0; g_htf_cache_time=0;
    g_str_last_high=0; g_str_last_low=0; g_str_trend=0; g_str_displacement=false; g_str_scanned_to=-1;
    g_last_alert_id=""; g_last_alert_bar=0; g_last_bar_time=0;
+   g_signal_mask=0; g_ob_search_path="not run";
+   for(int i=0;i<FLAG_COUNT;i++) g_signal_flags[i]=false;
 
    Print("======================================================");
-   Print(" Quantum SMC AI v5.7.0 - SIGNAL ENGINE REPAIR (DebugMode=",DebugMode?"ON":"OFF",")");
+   Print(" Quantum SMC AI v5.8.0 - P1 SIGNAL ENGINE INPUTS (DebugMode=",DebugMode?"ON":"OFF",")");
    Print("======================================================");
    Print(" Symbol: ",_Symbol," | Digits: ",(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
    Print(" Point: ",DoubleToString(_Point,5)," | PipSize: ",DoubleToString(PipSize(),5));
@@ -1114,7 +1153,9 @@ int OnInit()
    Print(" - Swing Fractal N: ",InpSwingFractalN);
    Print(" - Liquidity Fractal N: ",InpLiquidityFractalN);
    Print(" - Displacement ATR: ",DoubleToString(InpDisplacementATR,2));
-   Print(" - Min Right Confirm Bars: ",InpMinRightConfirmBars);
+   Print(" - Min Right Confirm Bars: ",InpMinRightConfirmBars," additional CLOSED bars after break");
+   Print(" - OB Search: ",InpUseBinarySearch?"BINARY INDEX":"LINEAR SCAN",
+         " | Signal Factors: ",InpUseBitMasking?"BITMASK":"BOOL FLAGS");
    Print(" - RealTime Zones: ",InpRealTimeZones ? "ON (Tick)" : "OFF (Confirmed)");
    Print(" - Update Every Tick: ",InpUpdateEveryTick ? "YES" : "NO (Bar Close)");
    Print(" - Incremental: ", InpUseIncrementalDetection ? "ON" : "OFF"," (tail window: ",InpIncrementalTailBars," bars)");
@@ -1123,7 +1164,7 @@ int OnInit()
    Print("======================================================");
    if(InpRealTimeZones)
       Print(">>> REALTIME MODE ACTIVE: zones/signals on closed bars only; RETEST requires a subsequent closed bar.");
-   Print(">>> v5.7.0: decision engine runs ONCE per closed bar; lifecycle runs on closed bars; setups are no longer overwritten by zone drift.");
+   Print(">>> v5.8.0: engine/lifecycle use closed bars; P1 right-confirm gate applies before setup scoring.");
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -1138,7 +1179,7 @@ void OnDeinit(const int reason)
    // A new configuration requires new signal evidence; remove old markers.
    ObjectsDeleteAll(0,SIGPFX); // never retain unvalidated arrows across parameter/TF changes
    Print("=========================================");
-   Print(" Quantum SMC v5.7.0 Stopped (reason ",reason,")");
+   Print(" Quantum SMC v5.8.0 Stopped (reason ",reason,")");
    Print(" Total Signals Generated: ",g_signal_count);
    Print("=========================================");
 }
@@ -1267,6 +1308,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       ArrayResize(g_ob_strength_idx,0,32);
       ArrayResize(g_liq_priority_idx,0,32);
       g_signal_mask=0;
+      for(int i=0;i<FLAG_COUNT;i++) g_signal_flags[i]=false;
       g_htf_cache_time=0; g_d1_cache_time=0;
       g_str_scanned_to=-1;   // reset causal structure scanner
 
@@ -1487,17 +1529,13 @@ void BuildLiquidityPriorityIndex()
       g_liq_priority_idx[j+1]=key;
    }
 }
-int BinarySearchNearestOB(const double target_price)
+int BinarySearchNearestOB(const double target_price,int &sorted_pos)
 {
+   // Return the master OB index AND its position in the sorted price index.
+   // The caller must still rank every eligible block, not just this nearest one.
    int n=ArraySize(g_ob_price_idx);
+   sorted_pos=-1;
    if(n==0) return -1;
-   if(!InpUseBinarySearch)
-   {
-      int b=-1; double bd=DBL_MAX;
-      for(int i=0;i<ArraySize(g_order_blocks);i++)
-      { double d=MathAbs(target_price-OBMid(i)); if(d<bd){bd=d; b=i;} }
-      return b;
-   }
    int lo=0,hi=n-1,best=g_ob_price_idx[0];
    double best_d=DBL_MAX;
    while(lo<=hi)
@@ -1506,57 +1544,91 @@ int BinarySearchNearestOB(const double target_price)
       int oi=g_ob_price_idx[mid];
       double mp=OBMid(oi);
       double d=MathAbs(target_price-mp);
-      if(d<best_d){best_d=d; best=oi;}
+      if(d<best_d){best_d=d; best=oi; sorted_pos=mid;}
       if(mp<target_price) lo=mid+1; else hi=mid-1;
    }
    return best;
 }
+bool IsLatestStructureConfirmed(const int closed_bar)
+{
+   int n=ArraySize(g_structures);
+   if(n==0 || closed_bar<0) return false;
+   int break_bar=g_structures[n-1].bar;
+   return break_bar>=0 && break_bar<=closed_bar &&
+          closed_bar-break_bar>=InpMinRightConfirmBars;
+}
+void MarkSignalFactor(const int flag,const int bit)
+{
+   if(InpUseBitMasking) g_signal_mask|=bit;
+   else                 g_signal_flags[flag]=true;
+}
 void UpdateSignalMask(const int total,const double &c[])
 {
    g_signal_mask=0;
-   // v5.7.0: the mask feeds the per-bar decision engine -> use the LAST CLOSED
-   // close, not the forming bar, so the decision is stable and reproducible.
-   double price=(total>=2)? c[total-2] : c[total-1];
+   for(int i=0;i<FLAG_COUNT;i++) g_signal_flags[i]=false;
+   if(total<3) return;
+   // Both paths use the LAST CLOSED bar. A detected break remains pending
+   // until InpMinRightConfirmBars more bars AFTER it have closed.
+   double price=c[total-2];
    int ns=ArraySize(g_structures);
-   if(ns>0)
+   if(IsLatestStructureConfirmed(total-2))
    {
       string ty=g_structures[ns-1].type;
-      if(ty=="MSS") g_signal_mask|=BIT_MSS;
-      else if(ty=="BOS") g_signal_mask|=BIT_BOS;
-      else if(ty=="CHoCH") g_signal_mask|=BIT_CHOCH;
+      if(ty=="MSS")        MarkSignalFactor(FLAG_MSS,BIT_MSS);
+      else if(ty=="BOS")   MarkSignalFactor(FLAG_BOS,BIT_BOS);
+      else if(ty=="CHoCH") MarkSignalFactor(FLAG_CHOCH,BIT_CHOCH);
    }
    for(int i=0;i<ArraySize(g_order_blocks);i++)
       if(g_order_blocks[i].strength>=4 && g_order_blocks[i].state!="MITIGATED")
-      {g_signal_mask|=BIT_STRONG_OB; break;}
+      {MarkSignalFactor(FLAG_STRONG_OB,BIT_STRONG_OB); break;}
    for(int i=ArraySize(g_liquidity)-1;i>=MathMax(0,ArraySize(g_liquidity)-3);i--)
-      if(g_liquidity[i].swept){g_signal_mask|=BIT_LIQUIDITY; break;}
+      if(g_liquidity[i].swept){MarkSignalFactor(FLAG_LIQUIDITY,BIT_LIQUIDITY); break;}
    for(int i=0;i<ArraySize(g_fvgs);i++)
-      if(g_fvgs[i].state=="OPEN"){g_signal_mask|=BIT_FVG; break;}
+      if(g_fvgs[i].state=="OPEN"){MarkSignalFactor(FLAG_FVG,BIT_FVG); break;}
    if(g_range.valid)
    {
       double ot=0,ob=0; bool ib=false;
       if(GetOTEZone(ot,ob,ib))
-         if(price<=ot && price>=ob) g_signal_mask|=BIT_OTE;
+         if(price<=ot && price>=ob) MarkSignalFactor(FLAG_OTE,BIT_OTE);
    }
-   if(g_htf_bias!=0) g_signal_mask|=BIT_HTF_BIAS;
+   if(g_htf_bias!=0) MarkSignalFactor(FLAG_HTF_BIAS,BIT_HTF_BIAS);
    MqlDateTime st; TimeToStruct(g_buf_t[g_rates_total-2],st);
    int hr=st.hour;
    if((hr>=InpLondonStart && hr<InpLondonStart+3) || (hr>=InpNewYorkStart && hr<InpNewYorkStart+3))
-      g_signal_mask|=BIT_KILLZONE;
+      MarkSignalFactor(FLAG_KILLZONE,BIT_KILLZONE);
    for(int i=0;i<ArraySize(g_zones);i++)
    {
       if(g_zones[i].state=="MITIGATED") continue;
       if(price<=g_zones[i].top && price>=g_zones[i].bottom)
       {
-         if(g_zones[i].bullish) g_signal_mask|=BIT_DEMAND_ZONE;
-         else                   g_signal_mask|=BIT_SUPPLY_ZONE;
+         if(g_zones[i].bullish) MarkSignalFactor(FLAG_DEMAND_ZONE,BIT_DEMAND_ZONE);
+         else                   MarkSignalFactor(FLAG_SUPPLY_ZONE,BIT_SUPPLY_ZONE);
       }
    }
-   if(g_judas!=0) g_signal_mask|=BIT_JUDAS;
+   if(g_judas!=0) MarkSignalFactor(FLAG_JUDAS,BIT_JUDAS);
+   if(DebugMode)
+   {
+      string path_log="[SignalMask] path=";
+      path_log+=(InpUseBitMasking?"BITMASK":"BOOL FLAGS");
+      path_log+=" closed="+IntegerToString(total-2);
+      path_log+=" structure=";
+      path_log+=(IsLatestStructureConfirmed(total-2)?"confirmed":"pending/none");
+      DebugPrint(path_log);
+   }
 }
 bool CheckSignalPattern(const int required_mask)
 {
-   return (g_signal_mask & required_mask)==required_mask;
+   if(InpUseBitMasking) return (g_signal_mask & required_mask)==required_mask;
+   // Boolean path: decode the existing BIT_* caller contract arithmetically,
+   // so not even combined patterns need a bitwise operation when disabled.
+   if(required_mask<0) return false;
+   int remaining=required_mask;
+   for(int i=0;i<FLAG_COUNT;i++)
+   {
+      if(remaining%2!=0 && !g_signal_flags[i]) return false;
+      remaining/=2;
+   }
+   return remaining==0; // unknown required bits are never treated as present
 }
 void AddGraphNode(const string type,const double price,const int strength)
 {
@@ -1805,17 +1877,35 @@ int SelectEntryOB(const double price,const bool is_buy,const double atr)
    int n=ArraySize(g_order_blocks);
    if(n==0)
    {
-      DebugPrint(">>> No Order Blocks found");
+      g_ob_search_path=InpUseBinarySearch?"skipped (no OB; binary configured)":"skipped (no OB; linear configured)";
+      DebugPrint(">>> OB Search path: "+g_ob_search_path);
       return -1;
    }
    double a=(atr>0)?atr:_Point*100;
    double max_dist=InpRelaxedMode ? a*12.0 : a*InpMaxOBDistATR;
+   int first=0,after=n,nearest_pos=-1;
+   if(InpUseBinarySearch && ArraySize(g_ob_price_idx)!=n) BuildOBPriceIndex();
+   bool indexed=(InpUseBinarySearch && ArraySize(g_ob_price_idx)==n);
+   if(indexed)
+   {
+      int nearest=BinarySearchNearestOB(price,nearest_pos);
+      if(nearest<0 || nearest_pos<0) indexed=false;
+      else
+      {
+         // Range by midpoint; evaluate EVERY eligible candidate with the
+         // original strength/distance/mitigation/direction rules below.
+         first=nearest_pos; after=nearest_pos+1;
+         while(first>0 && MathAbs(price-OBMid(g_ob_price_idx[first-1]))<=max_dist) first--;
+         while(after<n && MathAbs(price-OBMid(g_ob_price_idx[after]))<=max_dist) after++;
+      }
+   }
+   g_ob_search_path=indexed?"binary price-index":"linear scan";
+   if(InpUseBinarySearch && !indexed) g_ob_search_path+=" (index unavailable)";
    int best=-1; double best_score=-DBL_MAX;
    int candidates=0;
-   int total_obs=0;
-   for(int i=0;i<n;i++)
+   for(int k=first;k<after;k++)
    {
-      total_obs++;
+      int i=indexed?g_ob_price_idx[k]:k;
       if(g_order_blocks[i].bullish!=is_buy) continue;
       if(g_order_blocks[i].state=="MITIGATED") continue;
       double mid=OBMid(i);
@@ -1830,12 +1920,16 @@ int SelectEntryOB(const double price,const bool is_buy,const double atr)
       double dscore=MathMax(0.0,100.0-(dist/a)*12.0);
       double score=g_order_blocks[i].strength*15.0+dscore;
       if(g_order_blocks[i].state=="TOUCHED") score*=(InpRelaxedMode?0.95:0.85);
-      if(score>best_score){best_score=score; best=i;}
+      // The binary traversal is price-ordered, not chronological: preserve
+      // the linear path's oldest-master-index winner when scores tie.
+      if(score>best_score || (score==best_score && (best<0 || i<best)))
+      {best_score=score; best=i;}
    }
    if(DebugMode || InpShowDebugAlerts)
    {
+      Print(">>> OB Search path: ",g_ob_search_path," | scanned ",after-first,"/",n);
       Print(StringFormat(">>> OB Search for %s:",is_buy?"BUY":"SELL"));
-      Print(StringFormat(" Total OBs: %d | Candidates: %d",total_obs,candidates));
+      Print(StringFormat(" Total OBs: %d | Candidates: %d",n,candidates));
       if(best>=0)
          Print(StringFormat(" Selected OB #%d (%s) | Strength: %d | Score: %.1f | Dist: %.2f ATR",best,g_order_blocks[best].id,g_order_blocks[best].strength,best_score,MathAbs(price-OBMid(best))/a));
       else
@@ -1934,10 +2028,11 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    g_score.structure=g_score.liquidity=g_score.orderblock=0;
    g_score.fvg=g_score.session=g_score.htf=g_score.algo=0;
    g_score.final_score=0;
+   g_ob_search_path="skipped (no confirmed structure)";
    if(ArraySize(g_structures)==0)
    {
       AddBlocker("No structure detected");
-      DebugPrint("========== SIGNAL CHECK ==========\nMarket Structure: FAIL\nFINAL           : REJECTED\nREASON          : No BOS/CHoCH/MSS detected\n==================================");
+      DebugPrint("========== SIGNAL CHECK ==========\nMarket Structure: FAIL\nRight Confirm   : FAIL (no break detected)\nFINAL           : REJECTED\nREASON          : No BOS/CHoCH/MSS detected\n==================================");
       return;
    }
    if(total<3) return;
@@ -1949,6 +2044,15 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    double price=c[closed_bar];
    double atr_val=g_atr;
    int    struct_age=closed_bar-last_str.bar;
+   bool gate_right_confirm=IsLatestStructureConfirmed(closed_bar);
+   if(!gate_right_confirm)
+   {
+      AddBlocker(StringFormat("Right confirmation %d/%d closed bars after break",struct_age,InpMinRightConfirmBars));
+      if(DebugMode)
+         Print(StringFormat("========== SIGNAL CHECK ==========\nBar (closed)    : %d\nMarket Structure: FAIL (%s%s pending)\nRight Confirm   : FAIL (%d < %d additional closed bars after break bar %d)\nFINAL           : REJECTED\nREASON          : Break not yet eligible for setup\n==================================",
+               closed_bar,last_str.type,is_buy?"+":"-",struct_age,InpMinRightConfirmBars,last_str.bar));
+      return; // pending structure cannot seed/replace a setup or influence scoring
+   }
    SSignalFactor f[]; ArrayResize(f,11);
    f[0].name="MSS"; f[0].value=25; f[0].weight=5; f[0].active=(last_str.type=="MSS");
    f[1].name="BOS"; f[1].value=20; f[1].weight=4; f[1].active=(last_str.type=="BOS");
@@ -2055,7 +2159,7 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    if(!gate_factors) AddBlocker(StringFormat("Only %d/%d factors (min %d)",active_factors,ArraySize(f),InpMinSignalFactors));
    if(!gate_age)     AddBlocker(StringFormat("Structure age %d > %d bars",struct_age,InpRetestTimeoutBars));
 
-   bool all_gates = gate_score && gate_prob && gate_grade && gate_ob && gate_htf && gate_factors && gate_age && spread_ok;
+   bool all_gates = gate_right_confirm && gate_score && gate_prob && gate_grade && gate_ob && gate_htf && gate_factors && gate_age && spread_ok;
 
    if(DebugMode)
    {
@@ -2073,6 +2177,9 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
       tbl+="\n========== "+dir+" CHECK ==========";
       tbl+=StringFormat("\nBar (closed)    : %d  %s",closed_bar,TimeToString(g_buf_t[closed_bar],TIME_DATE|TIME_MINUTES));
       tbl+=StringFormat("\nMarket Structure: PASS  (%s%s age %d)",last_str.type,is_buy?"+":"-",struct_age);
+      tbl+=StringFormat("\nRight Confirm   : %s  (%d >= %d closed bars after break)",PF(gate_right_confirm),struct_age,InpMinRightConfirmBars);
+      tbl+=StringFormat("\nMask Path       : PASS  (%s)",InpUseBitMasking?"BITMASK":"BOOL FLAGS");
+      tbl+=StringFormat("\nOB Search Path  : %s  (%s)",ArraySize(g_order_blocks)>0?"PASS":"SKIPPED",g_ob_search_path);
       tbl+=StringFormat("\nStructure Age   : %s  (%d <= %d)",PF(gate_age),struct_age,InpRetestTimeoutBars);
       tbl+=StringFormat("\nHTF Bias        : %s  (bias=%s, required=%s)",PF(!InpRequireHTFBias || ctx_htf_aligned),g_htf_bias==1?"BULL":(g_htf_bias==-1?"BEAR":"NEUTRAL"),InpRequireHTFBias?"yes":"no");
       tbl+=StringFormat("\nLiquidity Sweep : %s  (factor)",PF(ctx_liq_swept));
@@ -2228,7 +2335,7 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
          zone_bottom=mid-min_zone_h*0.5;
       }
       entry_price=(zone_top+zone_bottom)*0.5;
-      double struct_price=g_structures[ArraySize(g_structures)-1].price;
+      double struct_price=last_str.price;
       sl_price=is_buy? struct_price - buf : struct_price + buf;
       if(is_buy && sl_price>=entry_price) sl_price=entry_price - (atr_val>0?atr_val:100*_Point);
       if(!is_buy && sl_price<=entry_price) sl_price=entry_price + (atr_val>0?atr_val:100*_Point);
@@ -3398,7 +3505,13 @@ void DrawQuantumDashboard(const int total,const double &c[])
    L[ln++]=StringFormat("Mode %s",InpRealTimeZones ? (InpUpdateEveryTick ? "REALTIME-TICK" : "REALTIME-BAR") : "CONFIRMED");
    if(InpShowLatencyInPanel)
       L[ln++]=StringFormat("Latency N:%d Disp:%.1f Confirm:%d",InpSwingFractalN,InpDisplacementATR,InpMinRightConfirmBars);
-   L[ln++]=StringFormat("Mask %s",IntegerToBinary(g_signal_mask));
+   if(InpUseBitMasking) L[ln++]=StringFormat("Mask %s",IntegerToBinary(g_signal_mask));
+   else
+   {
+      int num_flags=0;
+      for(int i=0;i<FLAG_COUNT;i++) if(g_signal_flags[i]) num_flags++;
+      L[ln++]=StringFormat("Factors BOOL %d/%d",num_flags,FLAG_COUNT);
+   }
    L[ln++]=StringFormat("Knap/DP %d / %d max %d",g_trade_setup.knapsack_score,g_trade_setup.dp_optimal_score,g_trade_setup.max_factor_value);
    if(InpShowDebugCounts)
       L[ln++]=StringFormat("Objects OB:%d FVG:%d LQ:%d ZN:%d BL:%d",ArraySize(g_order_blocks),ArraySize(g_fvgs),ArraySize(g_liquidity),ArraySize(g_zones),ArraySize(g_setup_blacklist));

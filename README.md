@@ -1,6 +1,6 @@
 # Quantum SMC — audited correctness increment
 
-Entry point: `QuantumSMC_AI_Pro_v5.6.9_COMPACT_DASHBOARD.mq5` (property version 5.71).
+Entry point: `QuantumSMC_AI_Pro_v5.6.9_COMPACT_DASHBOARD.mq5` (property version 5.80; P1 input wiring).
 The checkout did not contain `KLJ.mq5`; the existing file was preserved.
 
 **This is not a completed predictive engine or a certified no-lookahead indicator.**
