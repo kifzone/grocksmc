@@ -68,9 +68,44 @@
 //| make this safe: nothing outside the tighter window was reachable   |
 //| in a single-new-bar increment anyway, since a bar's own detectors  |
 //| only ever look at that bar and a small fixed lookback around it.   |
+//|                                                                    |
+//| ============ SIGNAL ENGINE REPAIR - v5.7.0 =====================   |
+//| Root causes fixed (see audit notes delivered with this build):     |
+//|  R1  OnCalculate fell into the FULL REBUILD branch on every tick    |
+//|      that was not a new bar (useIncremental required is_new_bar),   |
+//|      so every tick wiped g_structures/OBs/FVGs and re-ran the       |
+//|      decision engine with live-bar data.                            |
+//|  R2  CalculateAITradeSetup() replaced g_active_setup whenever the    |
+//|      candidate SetupId differed. The id embeds the zone, and the     |
+//|      zone follows live price (OB distance ranking / synthetic zone   |
+//|      centred on price), so READY/RETEST/CONFIRMED setups were        |
+//|      overwritten tick after tick -> "signal appears then vanishes". |
+//|  R3  The CONFIRMED alert was only de-duplicated by bar time, so it   |
+//|      re-fired on every new bar while the signal stayed valid.       |
+//|  R4  Incremental DetectStructure restarted with trend=0 and an      |
+//|      empty swing memory on a 12-bar tail -> missed / mislabelled    |
+//|      BOS/CHoCH/MSS. Full scan also used a fractal N bars before it  |
+//|      was confirmable (look-ahead). Now one causal state machine.    |
+//|  R5  Incremental path never re-checked liquidity sweeps of pools    |
+//|      detected earlier, never refreshed HTF bias / dealing range /   |
+//|      Judas / kill zones, and duplicated breakers on every bar.      |
+//|  R6  ComputeHTFBias cached dh[0] (the OLDEST D1 bar of the lookback) |
+//|      as PDH/PDL/PDC -> wrong PDH/PDL lines, pivots, camarilla, TPs.  |
+//|  R7  EMA incremental CopyBuffer used start_pos=total-3 (the oldest  |
+//|      bars); VWAP cumulative sums were incremented on every tick.    |
+//|  R8  Stale chart objects: SmartObjectCleanup used a wrong OB name   |
+//|      pattern, never removed STR_/LIQ_/ZN_/BRK_ labels or ENTRY/SL/   |
+//|      TP lines after a setup retired; DrawTextLabel never updated.   |
+//|  R9  Setups seeded from a structure older than the retest timeout    |
+//|      were created, instantly invalidated and blacklisted; fuzzy      |
+//|      blacklist had no expiry -> engine silently locked.             |
+//|  R10 New: DebugMode prints a PASS/FAIL table per gate with the      |
+//|      exact rejection reason; CopyBuffer failures are reported.      |
+//|  R11 Confirmed signals now leave a persistent, never-moved arrow    |
+//|      (QSMCSIG_ prefix) so history stays consistent after refresh.   |
 //+------------------------------------------------------------------+
-#property copyright "Quantum SMC AI Pro v5.4.1 Audited"
-#property version   "5.41"
+#property copyright "Quantum SMC AI Pro v5.7.0 Signal Engine Repair"
+#property version   "5.70"
 #property indicator_chart_window
 #property indicator_buffers 3
 #property indicator_plots   3
@@ -232,6 +267,7 @@ input color InpColorEQ = clrSilver;
 input color InpColorFib = clrDarkGray;
 input color InpColorOTE = clrAqua;
 input group "====== DEBUGGING ======"
+input bool DebugMode = false;            // v5.7.0: print PASS/FAIL table for every gate + error diagnostics
 input bool InpShowDebugAlerts = false;
 input bool InpLogSignalDetails = true;
 input group "====== REAL-TIME MODE ======"
@@ -263,6 +299,7 @@ input bool   InpLogLifecycleTransitions = false;
 input int    InpIncrementalTailBars     = 12;  // v5.4.1: how many recent bars the incremental path actually rescans
 
 #define PFX "QSMC_"
+#define SIGPFX "QSMCSIG_"   // v5.7.0: persistent confirmed-signal markers (never touched by per-bar cleanup)
 
 //--- bit masking
 #define BIT_MSS           (1<<0)
@@ -276,6 +313,7 @@ input int    InpIncrementalTailBars     = 12;  // v5.4.1: how many recent bars t
 #define BIT_KILLZONE      (1<<8)
 #define BIT_DEMAND_ZONE   (1<<9)
 #define BIT_JUDAS         (1<<10)
+#define BIT_SUPPLY_ZONE   (1<<11)   // v5.7.0: SELL-side twin of BIT_DEMAND_ZONE (was missing -> SELL stricter than BUY)
 #define MAX_GRAPH_LINKS   16
 
 //====================================================================
@@ -313,6 +351,16 @@ bool g_needs_full_rebuild=false;
 //--- P0.4 enhanced blacklist: store idea hash + zone center + tolerance
 string g_blacklist_zone_type[]; // "BUY"/"SELL"
 double g_blacklist_zone_center[];
+//--- v5.7.0 persistent structure-scanner state (true incremental, causal)
+double g_str_last_high=0.0, g_str_last_low=0.0;
+int    g_str_trend=0;
+bool   g_str_displacement=false;
+int    g_str_scanned_to=-1;          // last CLOSED bar index already processed (-1 = never)
+//--- v5.7.0 alert de-dup by signal identity (setup id + confirmed time + direction)
+string g_last_alert_id="";
+//--- v5.7.0 VWAP: cumulative sums cover CLOSED bars only; live bar is computed without mutating them
+int    g_vwap_closed_to=-1;
+bool   g_ema_filled=false;
 
 //====================================================================
 // STRUCTURES
@@ -605,6 +653,15 @@ bool IsSameIdeaAsBlacklisted(const bool is_buy, const double zt, const double zb
 void SmartObjectCleanup(const bool isNewBar);
 void LogLifecycle(const string msg);
 bool SweepHasDisplacementOrVolume(const int sweep_bar, const bool is_high, const double level, const double atr, const double &h[], const double &l[], const double &o[], const double &c[], const long &tv[]);
+//--- v5.7.0 helpers
+void RefreshVolatilityAndSpread(const int total);
+void UpdateLiquiditySweeps(const int total,const double &h[],const double &l[],const double &c[],const double &o[],const long &tv[],const datetime &t[]);
+void UpdateBreakerStates(const int total,const double &h[],const double &l[],const double &c[]);
+bool IsDuplicateBreaker(const int bar,const double top,const double bottom,const bool bullish);
+void DebugPrint(const string msg);
+void DebugError(const string func,const string what,const int err);
+string PF(const bool ok);
+void DrawPersistentSignal(const bool is_buy,const datetime tm,const double price,const string grade);
 
 //====================================================================
 // HELPERS - Stable IDs & Blacklist
@@ -707,8 +764,14 @@ bool IsSameIdeaAsBlacklisted(const bool is_buy, const double zt, const double zb
    double center=(zt+zb)*0.5;
    double tol=(g_atr>0? g_atr*0.30 : 8*PipSize());
    string dir=is_buy?"BUY":"SELL";
+   // v5.7.0 (R9): fuzzy entries expire. Without an expiry the blacklist
+   // accumulated price-centred zones and blocked every later idea in the
+   // same direction near price, permanently locking the engine.
+   datetime now_t = (g_rates_total>0 && ArraySize(g_buf_t)>=g_rates_total) ? g_buf_t[g_rates_total-1] : TimeCurrent();
+   long horizon = (long)MathMax(1,InpRetestTimeoutBars)*2*(long)PeriodSeconds();
    for(int i=0;i<n;i++)
    {
+      if(i<ArraySize(g_blacklist_time) && g_blacklist_time[i]>0 && (long)(now_t-g_blacklist_time[i])>horizon) continue;
       // quick direction filter via substring
       if(StringFind(g_setup_blacklist[i],dir)<0) continue;
       // compare stored center if available
@@ -810,6 +873,106 @@ bool SweepHasDisplacementOrVolume(const int sweep_bar, const bool is_high, const
    if(beyond < (atr>0? atr*0.15 : 3*PipSize())) disp=false;
    return disp;
 }
+//====================================================================
+// v5.7.0 HELPERS - debug, diagnostics, incremental maintenance
+//====================================================================
+void DebugPrint(const string msg){ if(DebugMode) Print(msg); }
+string PF(const bool ok){ return ok ? "PASS" : "FAIL"; }
+void DebugError(const string func,const string what,const int err)
+{
+   // Critical data failures are always reported (once per call site per bar is
+   // naturally bounded because detection runs per bar, not per tick).
+   Print(StringFormat("[ERROR] %s: %s | Symbol: %s | TF: %s | Error: %d",func,what,_Symbol,TFName((ENUM_TIMEFRAMES)_Period),err));
+}
+void RefreshVolatilityAndSpread(const int total)
+{
+   // g_atr / g_adx are read from the LAST CLOSED bar (shift 1) so that every
+   // decision made on a closed candle is reproducible after refresh/restart.
+   double tmp[]; ArraySetAsSeries(tmp,false);
+   ResetLastError();
+   if(CopyBuffer(h_atr,0,1,1,tmp)==1 && tmp[0]>0) g_atr=tmp[0];
+   else DebugError("RefreshVolatilityAndSpread","CopyBuffer ATR shift 1 failed",GetLastError());
+   ResetLastError();
+   if(CopyBuffer(h_adx,0,1,1,tmp)==1) g_adx=tmp[0];
+   else DebugError("RefreshVolatilityAndSpread","CopyBuffer ADX shift 1 failed",GetLastError());
+   g_spread=SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
+}
+bool IsDuplicateBreaker(const int bar,const double top,const double bottom,const bool bullish)
+{
+   for(int i=0;i<ArraySize(g_breakers);i++)
+      if(g_breakers[i].bar==bar && g_breakers[i].bullish==bullish &&
+         MathAbs(g_breakers[i].top-top)<_Point*2 && MathAbs(g_breakers[i].bottom-bottom)<_Point*2) return true;
+   return false;
+}
+void UpdateBreakerStates(const int total,const double &h[],const double &l[],const double &c[])
+{
+   // incremental: touch / clear on the newly closed bar only
+   if(total<3) return;
+   int closed=total-2;
+   for(int i=ArraySize(g_breakers)-1;i>=0;i--)
+   {
+      if(g_breakers[i].bar>=closed) continue;
+      bool cleared=false;
+      if(g_breakers[i].bullish){ if(l[closed]<=g_breakers[i].top && l[closed]>=g_breakers[i].bottom) g_breakers[i].state="TOUCHED"; if(c[closed]<g_breakers[i].bottom) cleared=true; }
+      else                     { if(h[closed]>=g_breakers[i].bottom && h[closed]<=g_breakers[i].top) g_breakers[i].state="TOUCHED"; if(c[closed]>g_breakers[i].top) cleared=true; }
+      if(cleared)
+      {
+         for(int k=i;k<ArraySize(g_breakers)-1;k++) g_breakers[k]=g_breakers[k+1];
+         ArrayResize(g_breakers,ArraySize(g_breakers)-1,8);
+      }
+   }
+}
+void UpdateLiquiditySweeps(const int total,const double &h[],const double &l[],const double &c[],const double &o[],const long &tv[],const datetime &t[])
+{
+   // v5.7.0 (R5): in the incremental path the pool itself is usually older than the
+   // tail window, so DetectLiquidity() hit IsDuplicateLiquidity() and `continue`d
+   // BEFORE its sweep loop -> pools were never marked swept -> "Liquidity Taken"
+   // could never activate live. This mirrors the original sweep rules (same
+   // tolerance, 15-bar window, P2.9 displacement/volume filter) on the closed bar.
+   if(total<3) return;
+   int closed=total-2;
+   double tol=(InpLiqToleranceATR>0 && g_atr>0)? g_atr*InpLiqToleranceATR : InpLiquidityTolerancePips*PipSize();
+   if(tol<=0) tol=5*PipSize();
+   int n=ArraySize(g_liquidity);
+   for(int i=0;i<n;i++)
+   {
+      if(g_liquidity[i].swept) continue;
+      bool is_high=false;
+      if(g_liquidity[i].type=="EQH") is_high=true;
+      else if(g_liquidity[i].type=="EQL") is_high=false;
+      else continue;
+      int pool_bar=g_liquidity[i].bar;
+      if(closed<=pool_bar || closed>=pool_bar+15) continue;
+      double level=g_liquidity[i].price;
+      bool sweepHigh=( is_high && h[closed]>level+tol && c[closed]<level);
+      bool sweepLow =(!is_high && l[closed]<level-tol && c[closed]>level);
+      if(!sweepHigh && !sweepLow) continue;
+      if(!SweepHasDisplacementOrVolume(closed,is_high,level,g_atr,h,l,o,c,tv)) continue;
+      double sweptTol=tol*0.7;
+      SLiquidity sw; sw.bar=closed; sw.time=t[closed]; sw.swept=true; sw.priority=0;
+      if(sweepHigh){ if(IsDuplicateLiquidity(h[closed],"BSL TAKEN",sweptTol)) continue; sw.price=h[closed]; sw.type="BSL TAKEN"; }
+      else         { if(IsDuplicateLiquidity(l[closed],"SSL TAKEN",sweptTol)) continue; sw.price=l[closed]; sw.type="SSL TAKEN"; }
+      int idx=ArraySize(g_liquidity); ArrayResize(g_liquidity,idx+1,16); g_liquidity[idx]=sw;
+      DebugPrint(StringFormat("[Liquidity] %s @ %s on closed bar %d",sw.type,DoubleToString(sw.price,_Digits),closed));
+   }
+}
+void DrawPersistentSignal(const bool is_buy,const datetime tm,const double price,const string grade)
+{
+   // v5.7.0 (R11): one immutable arrow per confirmed signal. Name = direction + bar time,
+   // so it is unique, is never re-created on a different bar, and survives per-bar cleanup.
+   string name=SIGPFX+(is_buy?"BUY_":"SELL_")+IntegerToString((long)tm);
+   if(ObjectFind(0,name)>=0) return;
+   ResetLastError();
+   if(!ObjectCreate(0,name,OBJ_ARROW,0,tm,price))
+   { DebugError("DrawPersistentSignal","ObjectCreate failed for "+name,GetLastError()); return; }
+   ObjectSetInteger(0,name,OBJPROP_ARROWCODE,is_buy?233:234);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,is_buy?clrLime:clrRed);
+   ObjectSetInteger(0,name,OBJPROP_WIDTH,2);
+   ObjectSetInteger(0,name,OBJPROP_ANCHOR,is_buy?ANCHOR_TOP:ANCHOR_BOTTOM);
+   ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,name,OBJPROP_BACK,false);
+   ObjectSetString(0,name,OBJPROP_TOOLTIP,StringFormat("%s %s CONFIRMED @ %s",grade,is_buy?"BUY":"SELL",DoubleToString(price,_Digits)));
+}
 void SmartObjectCleanup(const bool isNewBar)
 {
    // P1.6: delete only dead objects, keep live ones
@@ -820,27 +983,34 @@ void SmartObjectCleanup(const bool isNewBar)
       ObjectDelete(0, PFX+"SETUPZONE");
       ObjectDelete(0, PFX+"SETUPZONE_L");
    }
-   // On new bar, prune old trade level arrows that no longer match valid setup
+   // v5.7.0 (R8): when no valid trade, remove ALL trade visuals (lines, arrow,
+   // connector, trade box). Previously ENTRY/SL/TP lines and the trade box were
+   // never deleted, so retired levels stayed on the chart indefinitely.
    if(!g_trade_setup.valid)
    {
-      // keep ENTRY/SL/TP lines? They should be removed when no valid setup, but we delete only if mismatch
-      // For simplicity, delete ENTRY_ARROW/CONNECT if no valid
       ObjectDelete(0, PFX+"ENTRY_ARROW");
       ObjectDelete(0, PFX+"CONNECT");
+      ObjectDelete(0, PFX+"ENTRY"); ObjectDelete(0, PFX+"SL");
+      ObjectDelete(0, PFX+"TP1"); ObjectDelete(0, PFX+"TP2"); ObjectDelete(0, PFX+"TP3");
+      ObjectDelete(0, PFX+"TRADE_BOX_BG");
+      for(int i=0;i<10;i++) ObjectDelete(0, PFX+"TBOX_"+IntegerToString(i));
    }
-   // Prune breaker/demand etc that are MITIGATED and no longer in arrays
-   // We have full lists; any object with index beyond ArraySize is dead
-   // Example: PFX+"BRK_"+i etc
-   // Instead of scanning all, on new bar delete objects with brute prefix scan for dead indices
+   // v5.7.0 (R8): index-named objects (STR_i, OB_i_bar, FVGi, ZN_i, BRK_i, LIQ_i, KZ_i)
+   // are re-drawn from the arrays once per bar. Arrays shift when caps are enforced,
+   // so index i may point at a different element next bar; the old brute-force
+   // "dead index" scan (and its wrong OB_i_i pattern) left stale labels behind.
+   // Deleting by prefix once per bar is cheap and exact. Dashboard/panels/lines
+   // with fixed names are untouched. SIGPFX markers are never touched here.
    if(isNewBar)
    {
-      // liquidity markers: keep only those in keep range
-      int nLiq=ArraySize(g_liquidity);
-      for(int i=nLiq+5;i<nLiq+20;i++){ ObjectDelete(0, PFX+"LIQ_"+IntegerToString(i)); }
-      int nFvg=ArraySize(g_fvgs);
-      for(int i=nFvg;i<nFvg+10;i++){ ObjectDelete(0, PFX+"FVG"+IntegerToString(i)); ObjectDelete(0, PFX+"FVG"+IntegerToString(i)+"_S"); }
-      int nOB=ArraySize(g_order_blocks);
-      for(int i=nOB;i<nOB+10;i++){ ObjectDelete(0, PFX+"OB_"+IntegerToString(i)+"_"+IntegerToString(i)); }
+      ObjectsDeleteAll(0, PFX+"STR_");
+      ObjectsDeleteAll(0, PFX+"OB_");
+      ObjectsDeleteAll(0, PFX+"FVG");
+      ObjectsDeleteAll(0, PFX+"ZN_");
+      ObjectsDeleteAll(0, PFX+"BRK_");
+      ObjectsDeleteAll(0, PFX+"LIQ_");
+      ObjectsDeleteAll(0, PFX+"KZ_");
+      ObjectDelete(0, PFX+"JUDAS");
    }
 }
 
@@ -856,6 +1026,13 @@ int OnInit()
    ArraySetAsSeries(BufEmaFast,false);
    ArraySetAsSeries(BufEmaSlow,false);
    ArraySetAsSeries(BufVWAP,false);
+   // v5.7.0: do not draw EMA lines over the warm-up region (values were 0.0 there)
+   PlotIndexSetDouble(0,PLOT_EMPTY_VALUE,0.0);
+   PlotIndexSetDouble(1,PLOT_EMPTY_VALUE,0.0);
+   PlotIndexSetDouble(2,PLOT_EMPTY_VALUE,0.0);
+   PlotIndexSetInteger(0,PLOT_DRAW_BEGIN,InpEMAFast);
+   PlotIndexSetInteger(1,PLOT_DRAW_BEGIN,InpEMASlow);
+   IndicatorSetString(INDICATOR_SHORTNAME,"Quantum SMC AI Pro v5.7.0");
 
    h_ema_fast = iMA(_Symbol, PERIOD_CURRENT, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
    h_ema_slow = iMA(_Symbol, PERIOD_CURRENT, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
@@ -900,11 +1077,13 @@ int OnInit()
    g_dash_lines=0;
    g_signal_count=0;
    g_is_backtest = (MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION) || MQLInfoInteger(MQL_VISUAL_MODE));
-   g_cum_pv=0; g_cum_v=0; g_vwap_anchor=0;
+   g_cum_pv=0; g_cum_v=0; g_vwap_anchor=0; g_vwap_closed_to=-1; g_ema_filled=false;
    g_d1_cache_time=0; g_htf_cache_time=0;
+   g_str_last_high=0; g_str_last_low=0; g_str_trend=0; g_str_displacement=false; g_str_scanned_to=-1;
+   g_last_alert_id=""; g_last_alert_bar=0; g_last_bar_time=0;
 
    Print("======================================================");
-   Print(" Quantum SMC AI v5.4.1 AUDITED - forward-decl + incremental-OB fix");
+   Print(" Quantum SMC AI v5.7.0 - SIGNAL ENGINE REPAIR (DebugMode=",DebugMode?"ON":"OFF",")");
    Print("======================================================");
    Print(" Symbol: ",_Symbol," | Digits: ",(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
    Print(" Point: ",DoubleToString(_Point,5)," | PipSize: ",DoubleToString(PipSize(),5));
@@ -923,7 +1102,7 @@ int OnInit()
    Print("======================================================");
    if(InpRealTimeZones)
       Print(">>> REALTIME MODE ACTIVE: zones/signals on closed bars only; RETEST allowed live.");
-   Print(">>> v5.4.1: forward declarations fixed (array-ref mismatch), DetectOrderBlocks now runs every incremental bar, tail scans genuinely bounded.");
+   Print(">>> v5.7.0: decision engine runs ONCE per closed bar; lifecycle (RETEST) runs per tick; setups are no longer overwritten by zone drift.");
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -931,10 +1110,17 @@ void OnDeinit(const int reason)
    IndicatorRelease(h_ema_fast); IndicatorRelease(h_ema_slow);
    IndicatorRelease(h_atr); IndicatorRelease(h_adx); IndicatorRelease(h_rsi);
    for(int i=0;i<5;i++) IndicatorRelease(h_ema_mtf[i]);
-   if(InpSmartObjectManagement) SmartObjectCleanup(true);
-   else ObjectsDeleteAll(0,PFX);
+   // Remove everything we own when the indicator is removed / re-initialised.
+   // (On a timeframe/parameter change the next OnCalculate does a full rebuild
+   //  and re-creates the chart state deterministically from closed bars.)
+   ObjectsDeleteAll(0,PFX);
+   // Persistent confirmed-signal arrows survive timeframe / parameter changes
+   // (they are anchored to bar time, so they remain historically consistent);
+   // they are removed only when the indicator itself is removed.
+   if(reason==REASON_REMOVE || reason==REASON_CHARTCLOSE || reason==REASON_PROGRAM)
+      ObjectsDeleteAll(0,SIGPFX);
    Print("=========================================");
-   Print(" Quantum SMC v5.4.1 Stopped");
+   Print(" Quantum SMC v5.7.0 Stopped (reason ",reason,")");
    Print(" Total Signals Generated: ",g_signal_count);
    Print("=========================================");
 }
@@ -968,7 +1154,15 @@ void RepositionDashboard()
 }
 
 //====================================================================
-// MAIN - OnCalculate with chronological enforcement & delta rendering
+// MAIN - OnCalculate
+// v5.7.0 execution model (R1):
+//   FULL REBUILD : first load / history reload / TF change / caps disabled
+//   NEW BAR      : incremental detection on the newly CLOSED bar (total-2),
+//                  then the decision engine (CalculateAITradeSetup) runs ONCE.
+//   TICK         : NO detection, NO engine. Only spread/ATR refresh,
+//                  setup lifecycle (live RETEST is by design), dashboards.
+// Result: every structure/OB/FVG/liquidity/setup decision is taken on closed
+// data exactly once, so it is reproducible after refresh, TF change, restart.
 //====================================================================
 int OnCalculate(const int rates_total, const int prev_calculated,
                 const datetime &time[], const double &open[], const double &high[],
@@ -981,25 +1175,32 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 
    //--- chronological check: ensure index 0 = oldest, rates_total-1 = live
    bool is_series = ArrayGetAsSeries(time);
-   datetime cur;
-   if(is_series) cur=time[0];
-   else cur=time[rates_total-1];
+   datetime cur = is_series ? time[0] : time[rates_total-1];
 
+   bool first_run  = (prev_calculated==0);
    bool is_new_bar = (cur != g_last_bar_time);
-   // respect InpUpdateEveryTick=false: skip tick updates
-   if(!is_new_bar && prev_calculated>0 && !InpUpdateEveryTick) return rates_total;
+   // respect InpUpdateEveryTick=false: skip pure tick updates
+   if(!is_new_bar && !first_run && !InpUpdateEveryTick) return rates_total;
    if(is_new_bar) g_last_bar_time=cur;
    g_rates_total=rates_total;
 
-   //--- P1.7 static price buffers: resize only when needed
-   bool needResize = (ArraySize(g_buf_o)!=rates_total);
-   // P1.5 decide incremental vs full rebuild
-   bool useIncremental = false;
-   if(InpUseIncrementalDetection && prev_calculated>0 && !g_needs_full_rebuild && is_new_bar && rates_total==g_last_rates_total+1 && rates_total>=3)
-      useIncremental = true;
-   else if(prev_calculated==0) g_needs_full_rebuild=true;
+   //--- decide execution mode ------------------------------------------------
+   bool full_rebuild = first_run || g_needs_full_rebuild || !InpUseIncrementalDetection
+                       || ArraySize(g_buf_o)!=g_last_rates_total;
+   if(!full_rebuild)
+   {
+      // history must have grown by exactly one bar on a new bar, or not at all on a tick
+      if(is_new_bar  && rates_total!=g_last_rates_total+1) full_rebuild=true;
+      if(!is_new_bar && rates_total!=g_last_rates_total)   full_rebuild=true;
+      // nothing tracked yet -> rebuild once per new bar until structure exists
+      if(is_new_bar && ArraySize(g_structures)==0) full_rebuild=true;
+   }
+   // !InpUseIncrementalDetection => full rebuild once per NEW BAR (never per tick)
+   if(!InpUseIncrementalDetection && !is_new_bar && !first_run && !g_needs_full_rebuild && ArraySize(g_buf_o)==rates_total)
+      full_rebuild=false;
 
-   if(needResize)
+   //--- P1.7 static price buffers: resize only when needed --------------------
+   if(ArraySize(g_buf_o)!=rates_total)
    {
       ArrayResize(g_buf_o, rates_total, 64);
       ArrayResize(g_buf_h, rates_total, 64);
@@ -1008,122 +1209,32 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       ArrayResize(g_buf_t, rates_total, 64);
       ArrayResize(g_buf_tv, rates_total, 64);
    }
-   // copy chronologically into static buffers (full or incremental tail)
-   if(useIncremental && !needResize)
+   // copy chronologically: everything on rebuild, last 3 bars on a new bar, last 2 on a tick
+   int copy_from = full_rebuild ? 0 : (is_new_bar ? MathMax(0,rates_total-3) : MathMax(0,rates_total-2));
+   for(int k=copy_from;k<rates_total;k++)
    {
-      // only last 2 bars changed (new bar + previous may update)
-      for(int k=MathMax(0,rates_total-3);k<rates_total;k++)
-      {
-         int src = is_series ? (rates_total-1-k) : k;
-         g_buf_o[k]=open[src]; g_buf_h[k]=high[src]; g_buf_l[k]=low[src]; g_buf_c[k]=close[src];
-         g_buf_t[k]=time[src]; g_buf_tv[k]=tick_volume[src];
-      }
+      int src = is_series ? (rates_total-1-k) : k;
+      g_buf_o[k]=open[src]; g_buf_h[k]=high[src]; g_buf_l[k]=low[src]; g_buf_c[k]=close[src];
+      g_buf_t[k]=time[src]; g_buf_tv[k]=tick_volume[src];
    }
-   else
-   {
-      if(is_series)
-      {
-         for(int i=0;i<rates_total;i++)
-         {
-            int src=rates_total-1-i;
-            g_buf_o[i]=open[src]; g_buf_h[i]=high[src]; g_buf_l[i]=low[src]; g_buf_c[i]=close[src];
-            g_buf_t[i]=time[src]; g_buf_tv[i]=tick_volume[src];
-         }
-      }
-      else
-      {
-         for(int i=0;i<rates_total;i++)
-         {
-            g_buf_o[i]=open[i]; g_buf_h[i]=high[i]; g_buf_l[i]=low[i]; g_buf_c[i]=close[i];
-            g_buf_t[i]=time[i]; g_buf_tv[i]=tick_volume[i];
-         }
-      }
-   }
-   // g_buf_* are the canonical price buffers (P1.7)
 
-   //--- incremental EMA/VWAP
-   FillEMAAndVWAP(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,g_buf_tv,is_new_bar || prev_calculated==0);
+   //--- EMA / VWAP (incremental; closed-bar cumulative VWAP)
+   if(full_rebuild){ g_ema_filled=false; g_vwap_closed_to=-1; g_vwap_anchor=0; }
+   FillEMAAndVWAP(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,g_buf_tv,is_new_bar || full_rebuild);
 
-   //--- determine redraw mode
-   bool needs_full_redraw = is_new_bar || prev_calculated==0;
-   // P1.6 Smart object management
+   //--- redraw mode & object management
+   bool needs_full_redraw = is_new_bar || full_rebuild;
    if(InpSmartObjectManagement)
       SmartObjectCleanup(needs_full_redraw);
    else if(needs_full_redraw)
       ObjectsDeleteAll(0,PFX);
 
-   //--- P1.5 Incremental vs Full rebuild
-   if(useIncremental && ArraySize(g_structures)>0)
+   bool run_engine=false;
+   int closed = rates_total-2;
+
+   if(full_rebuild)
    {
-      // Incremental: update mitigations for new closed bar (total-2) only
-      int closed = rates_total-2;
-      if(closed>=0 && closed<rates_total)
-      {
-         // update ATR/ADX for new bar
-         double atr_tmp[],adx_tmp[];
-         ArraySetAsSeries(atr_tmp,false); ArraySetAsSeries(adx_tmp,false);
-         if(CopyBuffer(h_atr,0,0,rates_total,atr_tmp)>0 && ArraySize(atr_tmp)==rates_total) g_atr=atr_tmp[rates_total-1];
-         else if(CopyBuffer(h_atr,0,0,1,atr_tmp)>0) g_atr=atr_tmp[0];
-         if(CopyBuffer(h_adx,0,0,rates_total,adx_tmp)>0 && ArraySize(adx_tmp)==rates_total) g_adx=adx_tmp[rates_total-1];
-         else if(CopyBuffer(h_adx,0,0,1,adx_tmp)>0) g_adx=adx_tmp[0];
-         g_spread=SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
-         // P0.3 & mitigation incremental updates
-         for(int i=0;i<ArraySize(g_fvgs);i++) ReevaluateFVGState(g_fvgs[i], rates_total, g_buf_h, g_buf_l);
-         // update OB/Zones mitigations for new closed bar
-         for(int i=0;i<ArraySize(g_order_blocks);i++)
-         {
-            if(g_order_blocks[i].state=="MITIGATED") continue;
-            bool bull=g_order_blocks[i].bullish;
-            if(bull && g_buf_l[closed]<=g_order_blocks[i].top && g_buf_l[closed]>=g_order_blocks[i].bottom) g_order_blocks[i].state="TOUCHED";
-            if(!bull && g_buf_h[closed]>=g_order_blocks[i].bottom && g_buf_h[closed]<=g_order_blocks[i].top) g_order_blocks[i].state="TOUCHED";
-            if(bull && g_buf_c[closed]<g_order_blocks[i].bottom){ g_order_blocks[i].mitigated=true; g_order_blocks[i].state="MITIGATED"; }
-            if(!bull && g_buf_c[closed]>g_order_blocks[i].top){ g_order_blocks[i].mitigated=true; g_order_blocks[i].state="MITIGATED"; }
-         }
-         for(int i=0;i<ArraySize(g_zones);i++)
-         {
-            if(g_zones[i].state=="MITIGATED") continue;
-            if(g_zones[i].bullish)
-            {
-               if(g_buf_l[closed]<=g_zones[i].top && g_buf_l[closed]>=g_zones[i].bottom){ g_zones[i].touches++; g_zones[i].state="MITIGATION"; }
-               if(g_buf_c[closed]<g_zones[i].bottom) g_zones[i].state="MITIGATED";
-            }
-            else
-            {
-               if(g_buf_h[closed]>=g_zones[i].bottom && g_buf_h[closed]<=g_zones[i].top){ g_zones[i].touches++; g_zones[i].state="MITIGATION"; }
-               if(g_buf_c[closed]>g_zones[i].top) g_zones[i].state="MITIGATED";
-            }
-         }
-         //--- v5.4.1 FIX #3: tail-only scan window instead of the full
-         //    lookback range, so "incremental" is genuinely O(tail) not
-         //    O(history) per new bar. The dedup guards inside each
-         //    detector (bar-match for structure, IsDuplicateOB/
-         //    IsDuplicateLiquidity, FVG merge-by-overlap) make repeated
-         //    calls on the same tail bars safe either way.
-         int tail_from = MathMax(0, closed - InpIncrementalTailBars);
-         DetectStructure(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,tail_from);
-         //--- v5.4.1 FIX #2: DetectOrderBlocks was MISSING here entirely.
-         //    Without this call, any new structure break found by the
-         //    line above never gets its Order Block created, because
-         //    DetectOrderBlocks() is the only place that turns
-         //    g_structures[].ob_bar into a real SOrderBlock. That broke
-         //    entry-OB selection and the whole SETUP lifecycle for every
-         //    bar after the first full rebuild.
-         DetectOrderBlocks(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t);
-         DetectFVG(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,tail_from);
-         DetectLiquidity(rates_total,g_buf_h,g_buf_l,g_buf_c,g_buf_o,g_buf_tv,g_buf_t,tail_from);
-         DetectZones(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,tail_from);
-         // rebuild indices
-         BuildOBPriceIndex(); BuildOBStrengthIndex(); BuildLiquidityPriorityIndex();
-         if(ArraySize(g_structures)>0) LogLifecycle(StringFormat("Incremental update: new closed=%d struct=%d OB=%d FVG=%d LQ=%d",closed,ArraySize(g_structures),ArraySize(g_order_blocks),ArraySize(g_fvgs),ArraySize(g_liquidity)));
-         EnforceArrayLimits();
-         UpdateSignalMask(rates_total,g_buf_c);
-         if(InpUseGraphTheory) BuildMarketGraph();
-         CalculateAITradeSetup(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c);
-      }
-   }
-   else
-   {
-      // Full rebuild (or first run)
+      //================= FULL REBUILD (first run / history change) ===========
       ArrayResize(g_structures,0,32);
       ArrayResize(g_order_blocks,0,32);
       ArrayResize(g_fvgs,0,32);
@@ -1136,15 +1247,9 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       ArrayResize(g_ob_strength_idx,0,32);
       ArrayResize(g_liq_priority_idx,0,32);
       g_signal_mask=0;
+      g_str_scanned_to=-1;   // reset causal structure scanner
 
-      //--- ATR / ADX - read chronologically: atr[rates_total-1] is live; we need last closed/live value
-      double atr_tmp[],adx_tmp[];
-      ArraySetAsSeries(atr_tmp,false); ArraySetAsSeries(adx_tmp,false);
-      if(CopyBuffer(h_atr,0,0,rates_total,atr_tmp)>0 && ArraySize(atr_tmp)==rates_total) g_atr=atr_tmp[rates_total-1];
-      else if(CopyBuffer(h_atr,0,0,1,atr_tmp)>0) g_atr=atr_tmp[0];
-      if(CopyBuffer(h_adx,0,0,rates_total,adx_tmp)>0 && ArraySize(adx_tmp)==rates_total) g_adx=adx_tmp[rates_total-1];
-      else if(CopyBuffer(h_adx,0,0,1,adx_tmp)>0) g_adx=adx_tmp[0];
-      g_spread=SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
+      RefreshVolatilityAndSpread(rates_total);
 
       DetectStructure(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t);
       DetectOrderBlocks(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t);
@@ -1158,13 +1263,75 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       ComputeHTFBias();
       if(InpDetectJudas) DetectJudasSwing(rates_total,g_buf_t,g_buf_h,g_buf_l,g_buf_c);
       if(InpShowKillZones) DetectKillZones(rates_total,g_buf_t,g_buf_h,g_buf_l);
+      g_needs_full_rebuild=false;
+      run_engine=true;
+      DebugPrint(StringFormat("[Engine] FULL REBUILD bars=%d struct=%d OB=%d FVG=%d LQ=%d ZN=%d",rates_total,ArraySize(g_structures),ArraySize(g_order_blocks),ArraySize(g_fvgs),ArraySize(g_liquidity),ArraySize(g_zones)));
+   }
+   else if(is_new_bar)
+   {
+      //================= NEW BAR: incremental update on the closed bar =======
+      RefreshVolatilityAndSpread(rates_total);
+
+      // P0.3 & mitigation incremental updates (closed bar only)
+      for(int i=0;i<ArraySize(g_fvgs);i++) ReevaluateFVGState(g_fvgs[i], rates_total, g_buf_h, g_buf_l);
+      for(int i=0;i<ArraySize(g_order_blocks);i++)
+      {
+         if(g_order_blocks[i].state=="MITIGATED") continue;
+         bool bull=g_order_blocks[i].bullish;
+         if(bull && g_buf_l[closed]<=g_order_blocks[i].top && g_buf_l[closed]>=g_order_blocks[i].bottom) g_order_blocks[i].state="TOUCHED";
+         if(!bull && g_buf_h[closed]>=g_order_blocks[i].bottom && g_buf_h[closed]<=g_order_blocks[i].top) g_order_blocks[i].state="TOUCHED";
+         if(bull && g_buf_c[closed]<g_order_blocks[i].bottom){ g_order_blocks[i].mitigated=true; g_order_blocks[i].state="MITIGATED"; }
+         if(!bull && g_buf_c[closed]>g_order_blocks[i].top){ g_order_blocks[i].mitigated=true; g_order_blocks[i].state="MITIGATED"; }
+      }
+      for(int i=0;i<ArraySize(g_zones);i++)
+      {
+         if(g_zones[i].state=="MITIGATED") continue;
+         if(g_zones[i].bullish)
+         {
+            if(g_buf_l[closed]<=g_zones[i].top && g_buf_l[closed]>=g_zones[i].bottom){ g_zones[i].touches++; g_zones[i].state="MITIGATION"; }
+            if(g_buf_c[closed]<g_zones[i].bottom) g_zones[i].state="MITIGATED";
+         }
+         else
+         {
+            if(g_buf_h[closed]>=g_zones[i].bottom && g_buf_h[closed]<=g_zones[i].top){ g_zones[i].touches++; g_zones[i].state="MITIGATION"; }
+            if(g_buf_c[closed]>g_zones[i].top) g_zones[i].state="MITIGATED";
+         }
+      }
+      UpdateBreakerStates(rates_total,g_buf_h,g_buf_l,g_buf_c);
+      UpdateLiquiditySweeps(rates_total,g_buf_h,g_buf_l,g_buf_c,g_buf_o,g_buf_tv,g_buf_t);
+
+      // Structure continues from its persistent causal state (exactly the bars
+      // not yet processed); local-pattern detectors rescan a short tail (dedup-guarded).
+      int tail_from = MathMax(0, closed - InpIncrementalTailBars);
+      DetectStructure(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,tail_from);
+      DetectOrderBlocks(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t);
+      DetectFVG(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,tail_from);
+      DetectLiquidity(rates_total,g_buf_h,g_buf_l,g_buf_c,g_buf_o,g_buf_tv,g_buf_t,tail_from);
+      DetectZones(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,tail_from);
+      // context that the old incremental branch never refreshed (R5)
+      DetectDealingRange(rates_total,g_buf_h,g_buf_l,g_buf_t);
+      ComputeHTFBias();
+      if(InpDetectJudas) DetectJudasSwing(rates_total,g_buf_t,g_buf_h,g_buf_l,g_buf_c);
+      if(InpShowKillZones){ ArrayResize(g_kill_zones,0,8); DetectKillZones(rates_total,g_buf_t,g_buf_h,g_buf_l); }
+      run_engine=true;
+      LogLifecycle(StringFormat("Incremental update: new closed=%d struct=%d OB=%d FVG=%d LQ=%d",closed,ArraySize(g_structures),ArraySize(g_order_blocks),ArraySize(g_fvgs),ArraySize(g_liquidity)));
+   }
+   else
+   {
+      //================= TICK: light refresh only ===========================
+      g_spread=SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
+   }
+   g_last_rates_total=rates_total;
+
+   //--- DECISION ENGINE: once per closed bar ----------------------------------
+   if(run_engine)
+   {
+      EnforceArrayLimits();
+      BuildOBPriceIndex(); BuildOBStrengthIndex(); BuildLiquidityPriorityIndex();
       UpdateSignalMask(rates_total,g_buf_c);
       if(InpUseGraphTheory) BuildMarketGraph();
       CalculateAITradeSetup(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c);
-      EnforceArrayLimits();
-      g_needs_full_rebuild=false;
    }
-   g_last_rates_total=rates_total;
 
    // lifecycle must run every tick (for live RETEST)
    ManageSetupLifecycle(rates_total,g_buf_o,g_buf_h,g_buf_l,g_buf_c,g_buf_t,is_new_bar);
@@ -1180,7 +1347,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
       DrawFVGZones();
       DrawLiquidityMarkers();
       if(InpShowKillZones) DrawKillZones();
-      if(InpDetectJudas && g_judas!=0)
+      if(InpDetectJudas && g_judas!=0 && g_judas_bar>=0 && g_judas_bar<rates_total)
          DrawTextLabel(PFX+"JUDAS",g_buf_t[g_judas_bar],
                        g_judas==1 ? g_buf_l[g_judas_bar] : g_buf_h[g_judas_bar],
                        g_judas==1 ? "JUDAS UP" : "JUDAS DN",
@@ -1197,15 +1364,12 @@ int OnCalculate(const int rates_total, const int prev_calculated,
    // setup zone: create on full, extend on tick
    if(InpUseRetestLifecycle && g_active_setup.active && (g_active_setup.state=="READY" || g_active_setup.state=="RETEST"))
    {
-      if(needs_full_redraw) DrawSetupZone(rates_total,g_buf_t);
+      if(needs_full_redraw || ObjectFind(0,PFX+"SETUPZONE")<0) DrawSetupZone(rates_total,g_buf_t);
       else
       {
          string name=PFX+"SETUPZONE";
-         if(ObjectFind(0,name)>=0)
-         {
-            datetime t2 = g_buf_t[rates_total-1] + (datetime)(PeriodSeconds()*15);
-            ObjectMove(0,name,1,t2,g_active_setup.zone_bottom);
-         }
+         datetime t2 = g_buf_t[rates_total-1] + (datetime)(PeriodSeconds()*15);
+         ObjectMove(0,name,1,t2,g_active_setup.zone_bottom);
       }
    }
    if(InpShowTradeBox && g_trade_setup.valid) DrawTradeBox();
@@ -1214,6 +1378,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 
    return rates_total;
 }
+
 
 //====================================================================
 // SYMBOL-AWARE PIP SIZE
@@ -1317,7 +1482,9 @@ int BinarySearchNearestOB(const double target_price)
 void UpdateSignalMask(const int total,const double &c[])
 {
    g_signal_mask=0;
-   double price=c[total-1];
+   // v5.7.0: the mask feeds the per-bar decision engine -> use the LAST CLOSED
+   // close, not the forming bar, so the decision is stable and reproducible.
+   double price=(total>=2)? c[total-2] : c[total-1];
    int ns=ArraySize(g_structures);
    if(ns>0)
    {
@@ -1345,9 +1512,14 @@ void UpdateSignalMask(const int total,const double &c[])
    if((hr>=InpLondonStart && hr<InpLondonStart+3) || (hr>=InpNewYorkStart && hr<InpNewYorkStart+3))
       g_signal_mask|=BIT_KILLZONE;
    for(int i=0;i<ArraySize(g_zones);i++)
-      if(g_zones[i].bullish && g_zones[i].state!="MITIGATED")
-         if(price<=g_zones[i].top && price>=g_zones[i].bottom)
-         {g_signal_mask|=BIT_DEMAND_ZONE; break;}
+   {
+      if(g_zones[i].state=="MITIGATED") continue;
+      if(price<=g_zones[i].top && price>=g_zones[i].bottom)
+      {
+         if(g_zones[i].bullish) g_signal_mask|=BIT_DEMAND_ZONE;
+         else                   g_signal_mask|=BIT_SUPPLY_ZONE;
+      }
+   }
    if(g_judas!=0) g_signal_mask|=BIT_JUDAS;
 }
 bool CheckSignalPattern(const int required_mask)
@@ -1496,8 +1668,8 @@ double ScoreFVG(const bool is_buy,const double price)
       if(price<=g_fvgs[i].top && price>=g_fvgs[i].bottom) v=100.0;
       best=MathMax(best,v);
    }
-   if(InpLogSignalDetails && fvg_count>0)
-      Print(StringFormat(">>> FVG Score: %.1f (%d FVGs)",best,fvg_count));
+   if(DebugMode && fvg_count>0)
+      Print(StringFormat(">>> FVG Score: %.1f (%d %s FVGs)",best,fvg_count,is_buy?"bullish":"bearish"));
    return best;
 }
 double ScoreSession()
@@ -1538,7 +1710,7 @@ int CalculateProbability(const int conf,const int knap,const int dp,const int ma
    if(CheckSignalPattern(BIT_KILLZONE)) prob+=3;
    if(g_judas!=0) prob+=2;
    if(CheckSignalPattern(BIT_MSS|BIT_STRONG_OB|BIT_LIQUIDITY|BIT_OTE)) prob+=5;
-   if(!InpIgnoreSpreadOffHours && g_spread>InpMaxSpreadPts) prob-=10;
+   if(!InpIgnoreSpreadOffHours && !(g_is_backtest && InpIgnoreSpreadInBacktest) && g_spread>InpMaxSpreadPts) prob-=10;
    if(g_adx>0 && g_adx<InpADXChopLevel) prob-=4;
    return (int)MathMax(0,MathMin(100,MathRound(prob)));
 }
@@ -1601,7 +1773,7 @@ int SelectEntryOB(const double price,const bool is_buy,const double atr)
    int n=ArraySize(g_order_blocks);
    if(n==0)
    {
-      if(InpShowDebugAlerts) Print(">>> No Order Blocks found");
+      DebugPrint(">>> No Order Blocks found");
       return -1;
    }
    double a=(atr>0)?atr:_Point*100;
@@ -1628,7 +1800,7 @@ int SelectEntryOB(const double price,const bool is_buy,const double atr)
       if(g_order_blocks[i].state=="TOUCHED") score*=(InpRelaxedMode?0.95:0.85);
       if(score>best_score){best_score=score; best=i;}
    }
-   if(InpShowDebugAlerts || InpLogSignalDetails)
+   if(DebugMode || InpShowDebugAlerts)
    {
       Print(StringFormat(">>> OB Search for %s:",is_buy?"BUY":"SELL"));
       Print(StringFormat(" Total OBs: %d | Candidates: %d",total_obs,candidates));
@@ -1732,11 +1904,21 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    g_score.structure=g_score.liquidity=g_score.orderblock=0;
    g_score.fvg=g_score.session=g_score.htf=g_score.algo=0;
    g_score.final_score=0;
-   if(ArraySize(g_structures)==0){AddBlocker("No structure detected"); if(InpShowDebugAlerts) Print(">>> BLOCKED: No structure"); return;}
+   if(ArraySize(g_structures)==0)
+   {
+      AddBlocker("No structure detected");
+      DebugPrint("========== SIGNAL CHECK ==========\nMarket Structure: FAIL\nFINAL           : REJECTED\nREASON          : No BOS/CHoCH/MSS detected\n==================================");
+      return;
+   }
+   if(total<3) return;
    SStructureBreak last_str=g_structures[ArraySize(g_structures)-1];
    bool is_buy=last_str.bullish;
-   double price=c[total-1];
+   //--- v5.7.0: the engine runs once per CLOSED bar -> reference price is the
+   //    last closed close (bar 1), never the forming bar (bar 0).
+   int    closed_bar=total-2;
+   double price=c[closed_bar];
    double atr_val=g_atr;
+   int    struct_age=closed_bar-last_str.bar;
    SSignalFactor f[]; ArrayResize(f,11);
    f[0].name="MSS"; f[0].value=25; f[0].weight=5; f[0].active=(last_str.type=="MSS");
    f[1].name="BOS"; f[1].value=20; f[1].weight=4; f[1].active=(last_str.type=="BOS");
@@ -1751,10 +1933,12 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    f[7].name="HTF Bias"; f[7].value=10; f[7].weight=3; f[7].active=(InpUseHTFBias && g_htf_bias!=0 && g_htf_bias==(is_buy?1:-1));
    f[8].name="Judas Swing"; f[8].value=10; f[8].weight=3; f[8].active=(InpDetectJudas && g_judas!=0 && g_judas==(is_buy?1:-1));
    f[9].name="Kill Zone"; f[9].value=10; f[9].weight=2; f[9].active=CheckSignalPattern(BIT_KILLZONE);
-   f[10].name="Demand Zone"; f[10].value=10; f[10].weight=2; f[10].active=CheckSignalPattern(BIT_DEMAND_ZONE);
+   // v5.7.0 (BUY/SELL symmetry): BUY looks for a Demand zone, SELL for a Supply zone
+   f[10].name=is_buy?"Demand Zone":"Supply Zone"; f[10].value=10; f[10].weight=2;
+   f[10].active=is_buy ? CheckSignalPattern(BIT_DEMAND_ZONE) : CheckSignalPattern(BIT_SUPPLY_ZONE);
    int active_factors=0;
    for(int i=0;i<ArraySize(f);i++) if(f[i].active){active_factors++; AddReason("+ "+f[i].name);}
-   if(InpLogSignalDetails) Print(StringFormat(">>> Active Factors: %d/%d (min required: %d)",active_factors,ArraySize(f),InpMinSignalFactors));
+   if(InpLogSignalDetails || DebugMode) Print(StringFormat(">>> [%s] Active Factors: %d/%d (min required: %d) | last structure %s%s age %d bars",is_buy?"BUY":"SELL",active_factors,ArraySize(f),InpMinSignalFactors,last_str.type,is_buy?"+":"-",struct_age));
    int maxp=MaxPossibleValue(f);
    g_trade_setup.max_factor_value=maxp;
    g_trade_setup.knapsack_score=KnapsackOptimizeSignals(f,30);
@@ -1785,7 +1969,7 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    if(g_is_backtest && InpIgnoreSpreadInBacktest)
    {
       spread_ok=true;
-      if(InpLogSignalDetails) Print(">>> Spread check bypassed (Backtest mode)");
+      DebugPrint(">>> Spread check bypassed (Backtest mode)");
    }
    else
    {
@@ -1800,24 +1984,87 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    g_trade_setup.institutional_grade=GetInstitutionalGrade(score,g_trade_setup.knapsack_score,g_trade_setup.dp_optimal_score,maxp);
    int min_conf=InpRelaxedMode?45:InpMinConfidenceScore;
    int min_prob=InpRelaxedMode?50:InpMinProbability;
-   bool gate_score=(score>=min_conf);
-   bool gate_prob=(g_trade_setup.probability>=min_prob);
-   bool gate_grade=(!InpBlockLowGrade || GradeRank(g_trade_setup.quality_grade)>=(int)InpMinGrade);
-   bool gate_ob=true;
+
+   //================================================================
+   // SIGNAL ENGINE - readable components (v5.7.0)
+   //   1. Market context  : last closed structure event (direction = is_buy)
+   //   2. HTF bias        : D1 + InpHTFBiasTF agreement (hard gate only if InpRequireHTFBias)
+   //   3. Liquidity/sweep : factor f[5] (informational unless it moves the score)
+   //   4. Structure age   : setup must be seedable before the retest timeout kills it
+   //   5. Entry zone      : OB (hard gate only if InpRequireOB), else FVG/zone/synthetic
+   //   6. Filters         : spread, score, probability, grade, factor count
+   //   7. Final           : all hard gates PASS -> candidate levels -> lifecycle
+   //================================================================
+   bool ctx_htf_aligned   = (g_htf_bias!=0 && g_htf_bias==(is_buy?1:-1));
+   bool ctx_liq_swept     = f[5].active;
+   bool ctx_fvg           = f[4].active;
+   bool ctx_ote           = f[6].active;
+   bool ctx_killzone      = f[9].active;
+   bool ctx_zone          = f[10].active;
+   bool ctx_ob_found      = (ob_idx>=0);
+
+   bool gate_score  =(score>=min_conf);
+   bool gate_prob   =(g_trade_setup.probability>=min_prob);
+   bool gate_grade  =(!InpBlockLowGrade || GradeRank(g_trade_setup.quality_grade)>=(int)InpMinGrade);
+   bool gate_ob     =true;
    if(InpRequireOB)
-   {
       gate_ob=(ob_idx>=0 && g_order_blocks[ob_idx].strength>=InpMinEntryOBStrength && g_order_blocks[ob_idx].state!="MITIGATED");
-   }
-   bool gate_htf=true;
-   if(InpRequireHTFBias) gate_htf=(g_htf_bias!=0 && g_htf_bias==(is_buy?1:-1));
+   bool gate_htf    =true;
+   if(InpRequireHTFBias) gate_htf=ctx_htf_aligned;
    bool gate_factors=(active_factors>=InpMinSignalFactors);
-   if(!gate_score) AddBlocker(StringFormat("Score %d < %d",score,min_conf));
-   if(!gate_prob) AddBlocker(StringFormat("Prob %d%% < %d%%",g_trade_setup.probability,min_prob));
-   if(!gate_grade) AddBlocker(StringFormat("Grade %s below %s",g_trade_setup.quality_grade,EnumToString((ENUM_MIN_GRADE)InpMinGrade)));
+   // v5.7.0 (R9): in lifecycle mode a setup created from a structure older than
+   // the retest timeout was seeded, invalidated on the very next lifecycle pass and
+   // blacklisted (poisoning later ideas). Reject it up-front with an explicit reason.
+   bool gate_age    =(!InpUseRetestLifecycle || InpRetestTimeoutBars<=0 || struct_age<=InpRetestTimeoutBars);
+
+   if(!gate_score)   AddBlocker(StringFormat("Score %d < %d",score,min_conf));
+   if(!gate_prob)    AddBlocker(StringFormat("Prob %d%% < %d%%",g_trade_setup.probability,min_prob));
+   if(!gate_grade)   AddBlocker(StringFormat("Grade %s below %s",g_trade_setup.quality_grade,EnumToString((ENUM_MIN_GRADE)InpMinGrade)));
    if(!gate_ob && InpRequireOB) AddBlocker("No valid Order Block (required)");
    if(!gate_htf && InpRequireHTFBias) AddBlocker("No HTF Bias alignment (required)");
    if(!gate_factors) AddBlocker(StringFormat("Only %d/%d factors (min %d)",active_factors,ArraySize(f),InpMinSignalFactors));
-   if(!(gate_score && gate_prob && gate_grade && gate_ob && gate_htf && gate_factors && spread_ok))
+   if(!gate_age)     AddBlocker(StringFormat("Structure age %d > %d bars",struct_age,InpRetestTimeoutBars));
+
+   bool all_gates = gate_score && gate_prob && gate_grade && gate_ob && gate_htf && gate_factors && gate_age && spread_ok;
+
+   if(DebugMode)
+   {
+      string dir=is_buy?"BUY":"SELL";
+      string reason="";
+      if(!spread_ok)        reason="Spread filter failed";
+      else if(!gate_age)    reason="Structure too old for retest lifecycle";
+      else if(!gate_htf)    reason="HTF bias alignment failed (required)";
+      else if(!gate_ob)     reason="Order Block gate failed (required)";
+      else if(!gate_factors)reason="Not enough confluence factors";
+      else if(!gate_score)  reason="Confidence score below minimum";
+      else if(!gate_prob)   reason="Probability below minimum";
+      else if(!gate_grade)  reason="Quality grade below minimum";
+      string tbl="";
+      tbl+="\n========== "+dir+" CHECK ==========";
+      tbl+=StringFormat("\nBar (closed)    : %d  %s",closed_bar,TimeToString(g_buf_t[closed_bar],TIME_DATE|TIME_MINUTES));
+      tbl+=StringFormat("\nMarket Structure: PASS  (%s%s age %d)",last_str.type,is_buy?"+":"-",struct_age);
+      tbl+=StringFormat("\nStructure Age   : %s  (%d <= %d)",PF(gate_age),struct_age,InpRetestTimeoutBars);
+      tbl+=StringFormat("\nHTF Bias        : %s  (bias=%s, required=%s)",PF(!InpRequireHTFBias || ctx_htf_aligned),g_htf_bias==1?"BULL":(g_htf_bias==-1?"BEAR":"NEUTRAL"),InpRequireHTFBias?"yes":"no");
+      tbl+=StringFormat("\nLiquidity Sweep : %s  (factor)",PF(ctx_liq_swept));
+      tbl+=StringFormat("\nDisplacement    : %s  (structure strength %d)",PF(last_str.strength>=5),last_str.strength);
+      tbl+=StringFormat("\nFVG             : %s  (factor)",PF(ctx_fvg));
+      tbl+=StringFormat("\nOrder Block     : %s  (%s)",PF(gate_ob),ctx_ob_found?StringFormat("OB str %d @ %.2f ATR",g_order_blocks[ob_idx].strength,g_trade_setup.ob_dist_atr):"none within range");
+      tbl+=StringFormat("\nPremium/Disc OTE: %s  (factor)",PF(ctx_ote));
+      tbl+=StringFormat("\n%s: %s  (factor)",is_buy?"Demand Zone     ":"Supply Zone     ",PF(ctx_zone));
+      tbl+=StringFormat("\nKill Zone       : %s  (factor)",PF(ctx_killzone));
+      tbl+=StringFormat("\nADX             : %.1f %s",g_adx,(g_adx>0 && g_adx<InpADXChopLevel)?"(CHOP penalty)":"");
+      tbl+=StringFormat("\nSpread Filter   : %s  (%d pts, max %d)",PF(spread_ok),(int)g_spread,InpMaxSpreadPts);
+      tbl+=StringFormat("\nFactors         : %s  (%d >= %d)",PF(gate_factors),active_factors,InpMinSignalFactors);
+      tbl+=StringFormat("\nScore           : %s  (%d >= %d)",PF(gate_score),score,min_conf);
+      tbl+=StringFormat("\nProbability     : %s  (%d%% >= %d%%)",PF(gate_prob),g_trade_setup.probability,min_prob);
+      tbl+=StringFormat("\nGrade           : %s  (%s)",PF(gate_grade),g_trade_setup.quality_grade);
+      tbl+=StringFormat("\n\nFINAL %-10s: %s",dir,all_gates?"ACCEPTED -> candidate levels":"REJECTED");
+      if(!all_gates) tbl+="\nREASON          : "+reason;
+      tbl+="\n===============================";
+      Print(tbl);
+   }
+
+   if(!all_gates)
    {
       if(InpShowDebugAlerts)
       {
@@ -1977,6 +2224,7 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
    if(!InpUseRetestLifecycle)
    {
       //--- legacy behavior: fire immediately, no retest wait
+      //    (engine now runs once per closed bar, so the counter no longer inflates per tick)
       g_trade_setup.valid=true;
       g_trade_setup.is_buy=is_buy;
       g_signal_count++;
@@ -1991,9 +2239,40 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
 
    //--- v5.3.0: seed/refresh the tracked setup with STABLE ID + blacklist
    string cand_id = GenerateSetupId(is_buy, last_str.time, zone_top, zone_bottom);
+
+   //--- v5.7.0 (R2) SETUP STATE MACHINE PROTECTION -----------------------------
+   // The candidate id embeds the zone. The zone depends on which OB ranks best at
+   // the current price and, for the synthetic fallback, on price itself - so the
+   // id can differ from the tracked one even when the IDEA is the same structure.
+   // Previously any id mismatch replaced g_active_setup, killing READY/RETEST/
+   // CONFIRMED setups on the next evaluation. Rules now:
+   //   * CONFIRMED  -> never replaced here (only SL/TP3/invalidation retire it)
+   //   * same structure anchor + same direction -> keep original zone (no repaint)
+   //   * a NEW structure event -> supersede the old READY/RETEST idea
+   if(g_active_setup.active)
+   {
+      if(g_active_setup.state=="CONFIRMED")
+      {
+         g_active_setup.ob_index_cache = FindOBIndexByUID(g_active_setup.ob_uid);
+         DebugPrint(">>> Active CONFIRMED setup kept: "+g_active_setup.id);
+         return;
+      }
+      if(g_active_setup.id==cand_id ||
+         (g_active_setup.created_time==last_str.time && g_active_setup.is_buy==is_buy))
+      {
+         g_active_setup.ob_index_cache = FindOBIndexByUID(g_active_setup.ob_uid);
+         DebugPrint(">>> Same idea still tracked ("+g_active_setup.state+"), zone frozen: "+g_active_setup.id);
+         return;
+      }
+      LogLifecycle("SUPERSEDED by new structure: "+g_active_setup.id+" -> "+cand_id);
+      DebugPrint(">>> Setup superseded by new structure event: "+cand_id);
+      g_active_setup.active=false;
+   }
+
    if(IsBlacklisted(cand_id) || IsSameIdeaAsBlacklisted(is_buy, zone_top, zone_bottom))
    {
-      if(InpLogSignalDetails) Print(">>> SETUP BLACKLISTED (exact/fuzzy), skip: ",cand_id);
+      AddBlocker("Idea blacklisted (recently invalidated/closed)");
+      if(InpLogSignalDetails || DebugMode) Print(">>> SETUP BLACKLISTED (exact/fuzzy), skip: ",cand_id);
       LogLifecycle("Blocked re-create same idea: "+cand_id);
       return;
    }
@@ -2021,15 +2300,14 @@ void CalculateAITradeSetup(const int total,const double &o[],const double &h[],c
       g_active_setup.rr1=rr1_calc; g_active_setup.rr2=rr2_calc; g_active_setup.rr3=rr3_calc;
       g_active_setup.risk_level=risk_lvl_calc; g_active_setup.risk_pips=risk_pips_calc;
       g_active_setup.confirmed_bar=-1;
+      g_active_setup.confirmed_time=0;
       g_active_setup.alert_fired=false;
-      if(InpLogSignalDetails)
-         Print(StringFormat(">>> SETUP READY: %s id=%s zone %.5f-%.5f (wait for retest)",is_buy?"BUY":"SELL",cand_id,zone_bottom,zone_top));
-   }
-   else
-   {
-      // same setup still active - refresh cache index (in case OB moved due to new bar? but id stable)
-      g_active_setup.ob_index_cache = FindOBIndexByUID(g_active_setup.ob_uid);
-      // also refresh zone/entry if re-evaluated? keep original zone to avoid repaint - do not overwrite
+      if(InpLogSignalDetails || DebugMode)
+         Print(StringFormat(">>> SETUP READY: %s id=%s zone %s-%s entry %s sl %s tp1 %s tp2 %s tp3 %s (wait for retest)",
+               is_buy?"BUY":"SELL",cand_id,DoubleToString(zone_bottom,_Digits),DoubleToString(zone_top,_Digits),
+               DoubleToString(entry_price,_Digits),DoubleToString(sl_price,_Digits),
+               DoubleToString(t1,_Digits),DoubleToString(t2,_Digits),DoubleToString(t3,_Digits)));
+      LogLifecycle("NONE->READY "+cand_id);
    }
 }
 
@@ -2099,8 +2377,8 @@ void ManageSetupLifecycle(const int total,const double &o[],const double &h[],co
 
    if(invalidated)
    {
-      if(InpLogSignalDetails && g_active_setup.state!="INVALID")
-         Print(">>> SETUP INVALIDATED (",g_active_setup.state,") - OB mitigated or price closed through zone/timeout/distance on bar ",closed);
+      if((InpLogSignalDetails || DebugMode) && g_active_setup.state!="INVALID")
+         Print(">>> SETUP INVALIDATED (",g_active_setup.state,") - OB mitigated or price closed through zone/timeout/distance on bar ",closed," id=",g_active_setup.id);
       LogLifecycle("INVALID -> "+g_active_setup.state+" id="+g_active_setup.id);
       BlacklistSetup(g_active_setup.id, t[closed]);
       g_active_setup.state="INVALID";
@@ -2135,7 +2413,20 @@ void ManageSetupLifecycle(const int total,const double &o[],const double &h[],co
          g_active_setup.confirmed_time=t[closed];
          g_signal_count++;
          LogLifecycle("RETEST->CONFIRMED "+g_active_setup.id+" @ "+DoubleToString(g_active_setup.entry,_Digits));
-         if(InpLogSignalDetails) Print(">>> SETUP CONFIRMED: ",is_buy?"BUY":"SELL"," @ ",DoubleToString(g_active_setup.entry,_Digits)," on closed bar ",closed);
+         // v5.7.0 (R11): immutable historical marker on the confirming CLOSED bar
+         DrawPersistentSignal(is_buy,t[closed],is_buy?l[closed]:h[closed],g_active_setup.quality_grade);
+         if(InpLogSignalDetails || DebugMode)
+            Print(StringFormat(">>> %s SIGNAL CONFIRMED | Entry %s | SL %s | TP1 %s | TP2 %s | TP3 %s | Bar %d %s | Grade %s C:%d%% P:%d%% | id=%s",
+                  is_buy?"BUY":"SELL",
+                  DoubleToString(g_active_setup.entry,_Digits),DoubleToString(g_active_setup.sl,_Digits),
+                  DoubleToString(g_active_setup.tp1,_Digits),DoubleToString(g_active_setup.tp2,_Digits),DoubleToString(g_active_setup.tp3,_Digits),
+                  closed,TimeToString(t[closed],TIME_DATE|TIME_MINUTES),
+                  g_active_setup.quality_grade,g_active_setup.confidence,g_active_setup.probability,g_active_setup.id));
+      }
+      else if(DebugMode)
+      {
+         Print(StringFormat("[Lifecycle] RETEST pending %s: inside_closed=%s close_dir=%s (bar %d) id=%s",
+               is_buy?"BUY":"SELL",PF(inside_closed),PF(is_buy?bullish_close:bearish_close),closed,g_active_setup.id));
       }
    }
 
@@ -2161,12 +2452,14 @@ void ManageSetupLifecycle(const int total,const double &o[],const double &h[],co
       // retirement on CLOSED bar beyond SL/TP3
       bool sl_hit = is_buy ? (l[closed] <= g_active_setup.sl) : (h[closed] >= g_active_setup.sl);
       bool tp3_hit = is_buy ? (h[closed] >= g_active_setup.tp3) : (l[closed] <= g_active_setup.tp3);
-      if(sl_hit || tp3_hit)
+      // never retire on the confirming bar itself (its wick already qualified the retest)
+      if(closed>g_active_setup.confirmed_bar && (sl_hit || tp3_hit))
       {
-         if(InpLogSignalDetails) Print(">>> SETUP CLOSED (",sl_hit?"SL":"TP3"," hit on closed bar) - blacklisting");
+         if(InpLogSignalDetails || DebugMode) Print(">>> SETUP CLOSED (",sl_hit?"SL":"TP3"," hit on closed bar ",closed,") - blacklisting ",g_active_setup.id);
+         LogLifecycle(StringFormat("CONFIRMED->CLOSED(%s) %s",sl_hit?"SL":"TP3",g_active_setup.id));
          BlacklistSetup(g_active_setup.id, t[closed]);
          g_active_setup.active=false;
-         // keep g_trade_setup.valid true for this bar so TradeLevels still draw; next new bar will clear
+         // keep g_trade_setup.valid true for this tick so TradeLevels still draw; next tick clears
       }
    }
 }
@@ -2189,15 +2482,28 @@ void FireSetupAlert(const datetime bar_time)
    }
 
    if(!g_trade_setup.valid) return;
-   if(bar_time==g_last_alert_bar) return;
+   //--- v5.7.0 (R3): de-duplicate by SIGNAL IDENTITY, not by bar time.
+   //    A CONFIRMED setup stays valid for many bars (until SL/TP3), and the old
+   //    bar-time guard re-fired the same alert on every new bar.
+   //    Identity = setup id + direction + confirmed bar time (lifecycle mode)
+   //             = direction + bar time (legacy immediate mode: one per bar, as before)
+   string sig_id;
+   if(InpUseRetestLifecycle)
+      sig_id=StringFormat("%s|%s|%I64d",g_active_setup.id,g_trade_setup.is_buy?"BUY":"SELL",(long)g_active_setup.confirmed_time);
+   else
+      sig_id=StringFormat("LEGACY|%s|%I64d",g_trade_setup.is_buy?"BUY":"SELL",(long)bar_time);
+   if(sig_id==g_last_alert_id) return;
+   g_last_alert_id=sig_id;
    g_last_alert_bar=bar_time;
-   string msg=StringFormat("%s %s | %s %s CONFIRMED | C:%d%% P:%d%% | RR 1:%.1f/%.1f/%.1f | Risk:%s",
+   string msg=StringFormat("%s %s | %s %s CONFIRMED | Entry %s SL %s TP1 %s TP2 %s TP3 %s | C:%d%% P:%d%% | RR 1:%.1f/%.1f/%.1f | Risk:%s",
       _Symbol,TFName((ENUM_TIMEFRAMES)_Period),
       g_trade_setup.quality_grade,g_trade_setup.is_buy?"BUY":"SELL",
+      DoubleToString(g_trade_setup.entry,_Digits),DoubleToString(g_trade_setup.sl,_Digits),
+      DoubleToString(g_trade_setup.tp1,_Digits),DoubleToString(g_trade_setup.tp2,_Digits),DoubleToString(g_trade_setup.tp3,_Digits),
       g_trade_setup.confidence,g_trade_setup.probability,
       g_trade_setup.rr1,g_trade_setup.rr2,g_trade_setup.rr3,g_trade_setup.risk_level);
    Alert(msg);
-   if(InpShowDebugAlerts) Print("ALERT FIRED: ",msg);
+   if(InpShowDebugAlerts || DebugMode) Print("ALERT FIRED [",sig_id,"]: ",msg);
 }
 
 //====================================================================
@@ -2205,64 +2511,80 @@ void FireSetupAlert(const datetime bar_time)
 //====================================================================
 void FillEMAAndVWAP(const int total,const double &o[],const double &h[],const double &l[],const double &c[],const datetime &t[],const long &tv[],const bool is_new_bar)
 {
-   // EMA - incremental copy last 3 bars if not new bar for performance
-   if(is_new_bar || total!=ArraySize(BufEmaFast))
+   //--- EMA: full copy once (or after a history change), then only the last 3 bars.
+   //    v5.7.0 (R7): the old incremental call used start_pos=total-3, which in
+   //    CopyBuffer() means "total-3 bars back from the present" = the OLDEST bars.
+   if(!g_ema_filled || total!=ArraySize(BufEmaFast))
    {
       double fastBuf[],slowBuf[];
       ArraySetAsSeries(fastBuf,false); ArraySetAsSeries(slowBuf,false);
+      ResetLastError();
       int nf=CopyBuffer(h_ema_fast,0,0,total,fastBuf);
+      if(nf<total) DebugError("FillEMAAndVWAP","CopyBuffer EMA fast full copy short ("+IntegerToString(nf)+"/"+IntegerToString(total)+")",GetLastError());
+      ResetLastError();
       int ns=CopyBuffer(h_ema_slow,0,0,total,slowBuf);
+      if(ns<total) DebugError("FillEMAAndVWAP","CopyBuffer EMA slow full copy short ("+IntegerToString(ns)+"/"+IntegerToString(total)+")",GetLastError());
       for(int i=0;i<total;i++)
       {
          BufEmaFast[i]=(nf>0 && i<ArraySize(fastBuf))?fastBuf[i]:0.0;
          BufEmaSlow[i]=(ns>0 && i<ArraySize(slowBuf))?slowBuf[i]:0.0;
       }
+      g_ema_filled=(nf==total && ns==total);
    }
    else
    {
       double fb[],sb[];
       ArraySetAsSeries(fb,false); ArraySetAsSeries(sb,false);
-      if(CopyBuffer(h_ema_fast,0,total-3,3,fb)==3)
-      {
-         for(int k=0;k<3;k++){ int i=total-3+k; if(i>=0 && i<total) BufEmaFast[i]=fb[k];}
-      }
-      if(CopyBuffer(h_ema_slow,0,total-3,3,sb)==3)
-      {
-         for(int k=0;k<3;k++){ int i=total-3+k; if(i>=0 && i<total) BufEmaSlow[i]=sb[k];}
-      }
+      int cnt=MathMin(3,total);
+      if(CopyBuffer(h_ema_fast,0,0,cnt,fb)==cnt)
+         for(int k=0;k<cnt;k++){ int i=total-cnt+k; if(i>=0 && i<total) BufEmaFast[i]=fb[k]; }
+      if(CopyBuffer(h_ema_slow,0,0,cnt,sb)==cnt)
+         for(int k=0;k<cnt;k++){ int i=total-cnt+k; if(i>=0 && i<total) BufEmaSlow[i]=sb[k]; }
    }
-   // VWAP incremental
-   datetime anchor=DayAnchor(t[total-1]);
-   if(anchor!=g_vwap_anchor || is_new_bar==false /* recompute incremental */)
+
+   //--- VWAP (session anchored at day start).
+   //    v5.7.0 (R7): g_cum_pv/g_cum_v now hold CLOSED bars only. The live bar is
+   //    evaluated as (cum + live) without mutating the sums, so ticks no longer
+   //    add the same forming bar over and over, and a new bar just folds the bar
+   //    that has just closed into the sums.
+   int live=total-1;
+   datetime anchor=DayAnchor(t[live]);
+   bool reset = (anchor!=g_vwap_anchor) || g_vwap_closed_to<0 || g_vwap_closed_to>total-2;
+   if(reset)
    {
-      // if new day or first run, reset cum
-      if(anchor!=g_vwap_anchor)
+      g_vwap_anchor=anchor;
+      g_cum_pv=0; g_cum_v=0;
+      for(int i=0;i<=total-2;i++)
       {
-         g_vwap_anchor=anchor;
-         g_cum_pv=0; g_cum_v=0;
-         for(int i=0;i<total;i++)
-         {
-            if(t[i]<anchor){BufVWAP[i]=c[i]; continue;}
-            double typical=(h[i]+l[i]+c[i])/3.0;
-            double v=(double)tv[i];
-            g_cum_pv+=typical*v; g_cum_v+=v;
-            BufVWAP[i]=(g_cum_v>0)?g_cum_pv/g_cum_v:typical;
-         }
+         if(t[i]<anchor){ BufVWAP[i]=c[i]; continue; }
+         double typical=(h[i]+l[i]+c[i])/3.0;
+         double v=(double)tv[i];
+         g_cum_pv+=typical*v; g_cum_v+=v;
+         BufVWAP[i]=(g_cum_v>0)?g_cum_pv/g_cum_v:typical;
       }
-      else
+      g_vwap_closed_to=total-2;
+   }
+   else
+   {
+      // fold any newly closed bars (normally exactly one on a new bar, none on a tick)
+      for(int i=g_vwap_closed_to+1;i<=total-2;i++)
       {
-         // incremental: only last bar
-         int i=total-1;
-         if(t[i]<anchor) BufVWAP[i]=c[i];
-         else
-         {
-            double typical=(h[i]+l[i]+c[i])/3.0;
-            double v=(double)tv[i];
-            g_cum_pv+=typical*v; g_cum_v+=v;
-            BufVWAP[i]=(g_cum_v>0)?g_cum_pv/g_cum_v:typical;
-            // previous bars already correct
-         }
+         if(t[i]<anchor){ BufVWAP[i]=c[i]; continue; }
+         double typical=(h[i]+l[i]+c[i])/3.0;
+         double v=(double)tv[i];
+         g_cum_pv+=typical*v; g_cum_v+=v;
+         BufVWAP[i]=(g_cum_v>0)?g_cum_pv/g_cum_v:typical;
       }
+      g_vwap_closed_to=total-2;
+   }
+   // live bar: non-destructive
+   if(t[live]<anchor) BufVWAP[live]=c[live];
+   else
+   {
+      double typical=(h[live]+l[live]+c[live])/3.0;
+      double v=(double)tv[live];
+      double pv=g_cum_pv+typical*v, vv=g_cum_v+v;
+      BufVWAP[live]=(vv>0)?pv/vv:typical;
    }
 }
 datetime DayAnchor(const datetime t)
@@ -2277,30 +2599,55 @@ datetime DayAnchor(const datetime t)
 //====================================================================
 void DetectStructure(const int total,const double &o[],const double &h[],const double &l[],const double &c[],const datetime &t[],const int scan_from=-1)
 {
+   //--- v5.7.0 (R4) CAUSAL STATE MACHINE -------------------------------------
+   // * A fractal at bar f (N bars each side) only becomes KNOWN at bar f+N.
+   //   The old full scan assigned last_high/last_low at bar f itself, i.e. it
+   //   used N future bars (look-ahead) and could therefore disagree with what
+   //   the same code produced live -> historical labels differed from live ones.
+   // * The old incremental call restarted with trend=0 and an empty swing
+   //   memory on a 12-bar tail, so breaks of older swings were missed and
+   //   MSS/CHoCH/BOS were mislabelled. State now persists across calls:
+   //   scan_from<0  -> full reset & full scan (rebuild path)
+   //   scan_from>=0 -> continue exactly from the first unprocessed closed bar.
    double atr[]; ArraySetAsSeries(atr,false);
-   if(CopyBuffer(h_atr,0,0,total,atr)<1) return;
-   double last_high=0,last_low=0;
-   int trend=0;
-   bool displacement=false;
-   int lastClosed = total-2;
-   if(lastClosed < InpSwingFractalN) return;
-   //--- v5.4.1 FIX #3: bound the rescan to a recent tail window when the
-   //    caller supplies scan_from (incremental path); full rebuild still
-   //    passes -1 and gets the original full-window behavior. Swing state
-   //    (last_high/last_low/trend) is naturally re-derived within the
-   //    window since the dedup-by-bar check below still guards against
-   //    re-adding a structure event that already exists.
-   int start_i = (scan_from>=0) ? MathMax(InpSwingFractalN, scan_from) : InpSwingFractalN;
-   for(int i=start_i;i<=lastClosed;i++)
+   ResetLastError();
+   if(CopyBuffer(h_atr,0,0,total,atr)<1){ DebugError("DetectStructure","CopyBuffer ATR failed",GetLastError()); return; }
+   int n=MathMax(1,InpSwingFractalN);
+   int lastClosed=total-2;
+   int minStart=MathMax(2*n,2);     // bar j evaluates fractal at j-n (needs j-2n>=0) and uses c[j-2]
+   if(lastClosed<minStart) return;
+
+   int start_j;
+   if(scan_from<0 || g_str_scanned_to<0)
    {
-      if(IsFractalHigh(h,i,InpSwingFractalN,total)) last_high=h[i];
-      if(IsFractalLow(l,i,InpSwingFractalN,total)) last_low=l[i];
+      g_str_last_high=0.0; g_str_last_low=0.0; g_str_trend=0; g_str_displacement=false;
+      start_j=minStart;
+   }
+   else
+   {
+      start_j=MathMax(minStart,g_str_scanned_to+1);
+      if(start_j>lastClosed) return;   // nothing new
+   }
+   double last_high=g_str_last_high, last_low=g_str_last_low;
+   int  trend=g_str_trend;
+   bool displacement=g_str_displacement;
+
+   for(int j=start_j;j<=lastClosed;j++)
+   {
+      // the swing that becomes confirmable on THIS closed bar
+      int f=j-n;
+      if(f>=n)
+      {
+         if(IsFractalHigh(h,f,n,total)) last_high=h[f];
+         if(IsFractalLow(l,f,n,total))  last_low=l[f];
+      }
+      int i=j; // break candidate bar (closed)
       if(last_high>0 && c[i]>last_high)
       {
          // P1.8 dedup for incremental: skip if structure at same bar already exists
          bool dup=false;
          for(int _k=0;_k<ArraySize(g_structures);_k++) if(g_structures[_k].bar==i && MathAbs(g_structures[_k].price-last_high)<_Point*2) {dup=true; break;}
-         if(dup){ last_high=0; continue; }
+         if(dup){ trend=1; last_high=0; continue; }
          string bt=""; int st=3;
          double move=c[i]-MathMax(c[i-1],c[i-2]);
          if(i<ArraySize(atr) && atr[i]>0 && move>=atr[i]*InpDisplacementATR){displacement=true; st=5;}
@@ -2313,13 +2660,14 @@ void DetectStructure(const int total,const double &o[],const double &h[],const d
          g_structures[idx].price=last_high; g_structures[idx].bullish=true;
          g_structures[idx].type=bt; g_structures[idx].ob_bar=ob_bar;
          g_structures[idx].strength=st; g_structures[idx].priority=st;
+         DebugPrint(StringFormat("[Structure] %s+ on closed bar %d %s broke %s (move %.1f ATR)",bt,i,TimeToString(t[i],TIME_DATE|TIME_MINUTES),DoubleToString(last_high,_Digits),(i<ArraySize(atr)&&atr[i]>0)?move/atr[i]:0.0));
          trend=1; last_high=0;
       }
       else if(last_low>0 && c[i]<last_low)
       {
          bool dup2=false;
          for(int _k=0;_k<ArraySize(g_structures);_k++) if(g_structures[_k].bar==i && MathAbs(g_structures[_k].price-last_low)<_Point*2) {dup2=true; break;}
-         if(dup2){ last_low=0; continue; }
+         if(dup2){ trend=-1; last_low=0; continue; }
          string bt=""; int st=3;
          double move=MathMin(c[i-1],c[i-2])-c[i];
          if(i<ArraySize(atr) && atr[i]>0 && move>=atr[i]*InpDisplacementATR){displacement=true; st=5;}
@@ -2332,9 +2680,14 @@ void DetectStructure(const int total,const double &o[],const double &h[],const d
          g_structures[idx].price=last_low; g_structures[idx].bullish=false;
          g_structures[idx].type=bt; g_structures[idx].ob_bar=ob_bar;
          g_structures[idx].strength=st; g_structures[idx].priority=st;
+         DebugPrint(StringFormat("[Structure] %s- on closed bar %d %s broke %s (move %.1f ATR)",bt,i,TimeToString(t[i],TIME_DATE|TIME_MINUTES),DoubleToString(last_low,_Digits),(i<ArraySize(atr)&&atr[i]>0)?move/atr[i]:0.0));
          trend=-1; last_low=0;
       }
    }
+   // persist state for the next incremental continuation
+   g_str_last_high=last_high; g_str_last_low=last_low;
+   g_str_trend=trend; g_str_displacement=displacement;
+   g_str_scanned_to=lastClosed;
 }
 bool IsFractalHigh(const double &h[],const int i,const int n,const int total)
 {
@@ -2467,6 +2820,9 @@ void AddBreakerBlock(const double &h[],const double &l[],const double &c[],const
       else {if(h[k]>=bottom && h[k]<=top) br.state="TOUCHED"; if(c[k]>top){cleared=true; break;}}
    }
    if(cleared) return;
+   // v5.7.0 (R5): DetectOrderBlocks re-evaluates mitigated OBs on every incremental
+   // pass; without this guard the same breaker was appended once per bar.
+   if(IsDuplicateBreaker(br.bar,br.top,br.bottom,br.bullish)) return;
    int idx=ArraySize(g_breakers); ArrayResize(g_breakers,idx+1,16); g_breakers[idx]=br;
 }
 void DetectZones(const int total,const double &o[],const double &h[],const double &l[],const double &c[],const datetime &t[],const int scan_from=-1)
@@ -2713,29 +3069,40 @@ void ComputeHTFBias()
    }
    g_memo_hit=false; g_htf_bias=0;
    int n=InpSwingLookback;
+   //--- v5.7.0 (R6 / MTF audit): HTF context uses CLOSED HTF bars only (start=1),
+   //    so the bias cannot flip intrabar and is identical after a refresh/restart.
    double hh[],hl[],hc[];
    ArraySetAsSeries(hh,false); ArraySetAsSeries(hl,false); ArraySetAsSeries(hc,false);
-   if(CopyHigh(_Symbol,InpHTFBiasTF,0,n,hh)<n) return;
-   if(CopyLow(_Symbol,InpHTFBiasTF,0,n,hl)<n) return;
-   if(CopyClose(_Symbol,InpHTFBiasTF,0,1,hc)<1) return;
+   ResetLastError();
+   if(CopyHigh(_Symbol,InpHTFBiasTF,1,n,hh)<n)  { DebugError("ComputeHTFBias","CopyHigh "+TFName(InpHTFBiasTF)+" failed/short",GetLastError()); return; }
+   if(CopyLow(_Symbol,InpHTFBiasTF,1,n,hl)<n)   { DebugError("ComputeHTFBias","CopyLow "+TFName(InpHTFBiasTF)+" failed/short",GetLastError()); return; }
+   if(CopyClose(_Symbol,InpHTFBiasTF,1,1,hc)<1) { DebugError("ComputeHTFBias","CopyClose "+TFName(InpHTFBiasTF)+" failed",GetLastError()); return; }
    int hi=0,lo=0;
    for(int i=0;i<n;i++){if(hh[i]>hh[hi]) hi=i; if(hl[i]<hl[lo]) lo=i;}
    double eq=(hh[hi]+hl[lo])*0.5; g_htf_eq=eq;
-   int htf_bias=(hc[0]<eq)?1:-1;
-   // cache D1
+   int htf_bias=(hc[0]<eq)?1:-1;   // below equilibrium = discount = bullish bias (unchanged rule)
+   // D1 macro context (closed daily bars)
    double dh[],dl[],dc[];
    ArraySetAsSeries(dh,false); ArraySetAsSeries(dl,false); ArraySetAsSeries(dc,false);
-   if(CopyHigh(_Symbol,PERIOD_D1,0,n,dh)>=n && CopyLow(_Symbol,PERIOD_D1,0,n,dl)>=n && CopyClose(_Symbol,PERIOD_D1,0,1,dc)>=1)
+   if(CopyHigh(_Symbol,PERIOD_D1,1,n,dh)>=n && CopyLow(_Symbol,PERIOD_D1,1,n,dl)>=n && CopyClose(_Symbol,PERIOD_D1,1,1,dc)>=1)
    {
       int dhi=0,dlo=0;
       for(int i=0;i<n;i++){if(dh[i]>dh[dhi]) dhi=i; if(dl[i]<dl[dlo]) dlo=i;}
       double deq=(dh[dhi]+dl[dlo])*0.5;
       int d_bias=(dc[0]<deq)?1:-1;
       g_htf_bias=(d_bias==htf_bias)?d_bias:0;
-      // cache D1 levels
-      if(dh[0]>0) { g_d1_high=dh[0]; g_d1_low=dl[0]; g_d1_close=dc[0]; }
+      // cache PREVIOUS DAY levels. With a chronological (non-series) array the
+      // most recent element is the LAST one; the old code took dh[0] = the day
+      // n bars ago, so PDH/PDL/pivots/camarilla/TP magnets were wrong.
+      if(dh[n-1]>0) { g_d1_high=dh[n-1]; g_d1_low=dl[n-1]; g_d1_close=dc[0]; }
    }
-   else g_htf_bias=htf_bias;
+   else
+   {
+      DebugError("ComputeHTFBias","D1 copy failed - using "+TFName(InpHTFBiasTF)+" bias only",GetLastError());
+      g_htf_bias=htf_bias;
+   }
+   DebugPrint(StringFormat("[HTF] %s bias=%d | combined D1+%s bias=%s | eq=%s | PDH %s PDL %s",TFName(InpHTFBiasTF),htf_bias,TFName(InpHTFBiasTF),
+              g_htf_bias==1?"BULL":(g_htf_bias==-1?"BEAR":"NEUTRAL"),DoubleToString(eq,_Digits),DoubleToString(g_d1_high,_Digits),DoubleToString(g_d1_low,_Digits)));
 }
 void DetectJudasSwing(const int total,const datetime &t[],const double &h[],const double &l[],const double &c[])
 {
@@ -2940,8 +3307,8 @@ void DrawQuantumDashboard(const int total,const double &c[])
    string L[]; ArrayResize(L,200);
    int ln=0;
    L[ln++]="=======================";
-   L[ln++]=" Quantum SMC AI v5.4.1";
-   L[ln++]=" AUDITED / SETUP-RETEST";
+   L[ln++]=" Quantum SMC AI v5.7.0";
+   L[ln++]=" SIGNAL ENGINE / SETUP-RETEST";
    L[ln++]="=======================";
    string signal;
    if(InpUseRetestLifecycle)
@@ -3331,7 +3698,9 @@ void DrawHLine(const string name,const double price,const color col,const string
 {
    if(ObjectFind(0,name)<0)
    {
-      ObjectCreate(0,name,OBJ_HLINE,0,0,price);
+      ResetLastError();
+      if(!ObjectCreate(0,name,OBJ_HLINE,0,0,price))
+      { DebugError("DrawHLine","ObjectCreate failed for "+name,GetLastError()); return; }
       ObjectSetInteger(0,name,OBJPROP_COLOR,col);
       ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_DOT);
       ObjectSetInteger(0,name,OBJPROP_WIDTH,width);
@@ -3343,13 +3712,20 @@ void DrawHLine(const string name,const double price,const color col,const string
 }
 void DrawTextLabel(const string name,const datetime tm,const double price,const string text,const color col,const bool above,const int font_size=8)
 {
-   if(ObjectFind(0,name)>=0) return;
-   ObjectCreate(0,name,OBJ_TEXT,0,tm,price);
+   // v5.7.0 (R8): existing labels are UPDATED (position/text/colour) instead of
+   // being left where they were first created.
+   if(ObjectFind(0,name)<0)
+   {
+      ResetLastError();
+      if(!ObjectCreate(0,name,OBJ_TEXT,0,tm,price))
+      { DebugError("DrawTextLabel","ObjectCreate failed for "+name,GetLastError()); return; }
+      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,font_size);
+      ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
+   }
+   else ObjectMove(0,name,0,tm,price);
    ObjectSetString(0,name,OBJPROP_TEXT," "+text);
    ObjectSetInteger(0,name,OBJPROP_COLOR,col);
-   ObjectSetInteger(0,name,OBJPROP_FONTSIZE,font_size);
    ObjectSetInteger(0,name,OBJPROP_ANCHOR,above?ANCHOR_LOWER:ANCHOR_UPPER);
-   ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
 }
 void DrawFibLine(const string name,const datetime t1,const datetime t2,const double price,const color col,const int style=STYLE_DOT,const int width=1)
 {
@@ -3369,7 +3745,9 @@ void DrawZoneBox(const string name,const datetime t1,const double p1,const datet
 {
    if(ObjectFind(0,name)<0)
    {
-      ObjectCreate(0,name,OBJ_RECTANGLE,0,t1,p1,t2,p2);
+      ResetLastError();
+      if(!ObjectCreate(0,name,OBJ_RECTANGLE,0,t1,p1,t2,p2))
+      { DebugError("DrawZoneBox","ObjectCreate failed for "+name,GetLastError()); return; }
       ObjectSetInteger(0,name,OBJPROP_FILL,true);
       ObjectSetInteger(0,name,OBJPROP_BACK,true);
       ObjectSetInteger(0,name,OBJPROP_COLOR,BlendColor(col,100-transparency));
@@ -3404,4 +3782,4 @@ string IntegerToBinary(const int num)
    for(int i=10;i>=0;i--) r+=((num & (1<<i))!=0)?"1":"0";
    return r;
 }
-//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
